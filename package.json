@@ -1,0 +1,13 @@
+{
+  "name": "translate-bubble",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "icons": "node scripts/make-icons.mjs",
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

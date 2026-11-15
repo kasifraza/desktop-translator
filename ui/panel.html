@@ -1,0 +1,160 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  :root {
+    --bg: #111318; --card: #1a1d24; --line: #2a2e38; --fg: #e7e9ee; --mute: #8b91a0;
+    --acc: #6366f1; --ok: #10b981; --err: #f87171;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font: 13px/1.45 "Segoe UI", system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; border: 1px solid var(--line); }
+  header { display: flex; align-items: center; gap: 4px; padding: 6px 6px 6px 12px;
+    border-bottom: 1px solid var(--line); user-select: none; }
+  header .t { font-weight: 600; flex: 1; }
+  .tab { background: none; border: 0; color: var(--mute); padding: 4px 10px; border-radius: 6px; cursor: pointer; font: inherit; }
+  .tab.on { color: var(--fg); background: var(--card); }
+  .x { background: none; border: 0; color: var(--mute); font-size: 16px; width: 28px; height: 26px; border-radius: 6px; cursor: pointer; }
+  .x:hover { background: #3a1e22; color: #fff; }
+  main { flex: 1; padding: 12px; display: flex; flex-direction: column; gap: 8px; overflow: auto; }
+  .hidden { display: none !important; }
+  textarea, input, select { width: 100%; background: var(--card); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 10px; font: inherit; outline: none; }
+  textarea { resize: none; flex: 1; min-height: 90px; }
+  textarea:focus, input:focus, select:focus { border-color: var(--acc); }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row .grow { flex: 1; }
+  button.p { background: var(--acc); color: #fff; border: 0; border-radius: 8px; padding: 7px 14px; font: inherit; font-weight: 600; cursor: pointer; }
+  button.s { background: var(--card); color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 7px 14px; font: inherit; cursor: pointer; }
+  button:disabled { opacity: .55; cursor: default; }
+  .msg { font-size: 12px; color: var(--mute); min-height: 16px; }
+  .msg.err { color: var(--err); } .msg.ok { color: var(--ok); }
+  label { font-size: 12px; color: var(--mute); display: block; margin: 4px 0 3px; }
+  .hint { font-size: 11.5px; color: var(--mute); }
+  code { background: var(--card); padding: 1px 5px; border-radius: 4px; }
+  fieldset { border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px 10px; margin: 0; }
+  legend { color: var(--mute); font-size: 12px; padding: 0 4px; }
+</style>
+</head>
+<body>
+<header data-tauri-drag-region>
+  <span class="t" data-tauri-drag-region>Translate Bubble</span>
+  <button class="tab on" data-tab="tr">Translate</button>
+  <button class="tab" data-tab="st">Settings</button>
+  <button class="x" id="close" title="Hide">✕</button>
+</header>
+
+<main id="tr">
+  <textarea id="src" placeholder="Type or paste English / Hinglish / हिंदी …   (Ctrl+Enter to convert)"></textarea>
+  <div class="row">
+    <button class="p" id="go">Convert</button>
+    <span class="msg grow" id="m"></span>
+  </div>
+  <textarea id="out" readonly placeholder="English result appears here"></textarea>
+  <div class="row">
+    <button class="s grow" id="copy">Copy result</button>
+  </div>
+</main>
+
+<main id="st" class="hidden">
+  <div>
+    <label>Translation engine</label>
+    <select id="provider">
+      <option value="auto">Auto — Ollama (local), fallback Google</option>
+      <option value="ollama">Ollama (local, private, offline)</option>
+      <option value="openai">OpenAI-compatible API (Groq / OpenRouter / LM Studio)</option>
+      <option value="google">Google free (no grammar fixing)</option>
+    </select>
+  </div>
+  <fieldset id="f-ollama"><legend>Ollama</legend>
+    <label>URL</label><input id="ollama_url" />
+    <label>Model</label><input id="ollama_model" />
+    <div class="hint">Install from ollama.com, then run <code>ollama pull qwen2.5:3b</code></div>
+  </fieldset>
+  <fieldset id="f-openai"><legend>OpenAI-compatible</legend>
+    <label>Base URL</label><input id="openai_base" />
+    <label>API key</label><input id="openai_key" type="password" />
+    <label>Model</label><input id="openai_model" />
+  </fieldset>
+  <div class="row">
+    <div class="grow"><label>Global hotkey</label><input id="hotkey" placeholder="Ctrl+Shift+Space" /></div>
+    <div class="grow"><label>On convert</label>
+      <select id="mode">
+        <option value="replace">Replace text in the box</option>
+        <option value="copy">Copy to clipboard only</option>
+      </select>
+    </div>
+  </div>
+  <div class="row">
+    <button class="p" id="save">Save</button>
+    <span class="msg grow" id="sm"></span>
+    <button class="s" id="quit">Quit app</button>
+  </div>
+</main>
+
+<script>
+  const { invoke } = window.__TAURI__.core;
+  const { listen } = window.__TAURI__.event;
+  const win = window.__TAURI__.window.getCurrentWindow();
+  const $ = id => document.getElementById(id);
+  const FIELDS = ['provider','ollama_url','ollama_model','openai_base','openai_key','openai_model','hotkey','mode'];
+
+  const msg = (el, text, cls = '') => { el.textContent = text; el.className = 'msg grow ' + cls; };
+
+  document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.toggle('on', x === t));
+    $('tr').classList.toggle('hidden', t.dataset.tab !== 'tr');
+    $('st').classList.toggle('hidden', t.dataset.tab !== 'st');
+  });
+  $('close').onclick = () => win.hide();
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') win.hide(); });
+
+  async function convert() {
+    const text = $('src').value;
+    if (!text.trim()) return;
+    $('go').disabled = true; msg($('m'), 'Converting…');
+    try {
+      $('out').value = await invoke('translate_text', { text });
+      msg($('m'), '');
+    } catch (e) { msg($('m'), String(e), 'err'); }
+    $('go').disabled = false;
+  }
+  $('go').onclick = convert;
+  $('src').addEventListener('keydown', e => { if (e.key === 'Enter' && e.ctrlKey) { e.preventDefault(); convert(); } });
+
+  $('copy').onclick = async () => {
+    if (!$('out').value) return;
+    try { await invoke('copy_text', { text: $('out').value }); msg($('m'), 'Copied ✓', 'ok'); }
+    catch (e) { msg($('m'), String(e), 'err'); }
+  };
+
+  listen('result', ({ payload }) => {
+    $('src').value = payload.original; $('out').value = payload.result; msg($('m'), 'Copied to clipboard ✓', 'ok');
+  });
+  listen('panel-error', ({ payload }) => msg($('m'), payload, 'err'));
+
+  // settings
+  const syncProvider = () => {
+    const p = $('provider').value;
+    $('f-ollama').classList.toggle('hidden', !(p === 'auto' || p === 'ollama'));
+    $('f-openai').classList.toggle('hidden', p !== 'openai');
+  };
+  $('provider').onchange = syncProvider;
+
+  (async () => {
+    const s = await invoke('get_settings');
+    FIELDS.forEach(k => $(k).value = s[k] ?? '');
+    syncProvider();
+  })();
+
+  $('save').onclick = async () => {
+    const settings = Object.fromEntries(FIELDS.map(k => [k, $(k).value.trim()]));
+    try { await invoke('save_settings', { settings }); msg($('sm'), 'Saved ✓', 'ok'); }
+    catch (e) { msg($('sm'), String(e), 'err'); }
+  };
+  $('quit').onclick = () => invoke('quit_app');
+</script>
+</body>
+</html>

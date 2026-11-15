@@ -1,0 +1,59 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; user-select: none; }
+  body { display: grid; place-items: center; font-family: "Segoe UI", system-ui, sans-serif; }
+  #b {
+    width: 50px; height: 50px; border-radius: 50%; position: relative; cursor: pointer;
+    background: linear-gradient(135deg, #6366f1, #10b981);
+    box-shadow: 0 3px 10px rgba(0,0,0,.35);
+    display: grid; place-items: center; color: #fff; font-weight: 700; font-size: 15px; letter-spacing: -.5px;
+    transition: transform .12s ease, background .2s;
+  }
+  #b:hover { transform: scale(1.07); }
+  #b:active { transform: scale(.95); }
+  #b .lbl { pointer-events: none; }
+  #b.busy::after {
+    content: ""; position: absolute; inset: -3px; border-radius: 50%;
+    border: 3px solid transparent; border-top-color: #fff; border-right-color: #fff;
+    animation: spin .7s linear infinite;
+  }
+  #b.done { background: #10b981; }
+  #b.error { background: #ef4444; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+  <div id="b" title="Click: convert text in the focused box to English&#10;Drag: move · Right-click: open panel">
+    <span class="lbl" id="l">अ→A</span>
+  </div>
+<script>
+  const { invoke } = window.__TAURI__.core;
+  const { listen } = window.__TAURI__.event;
+  const win = window.__TAURI__.window.getCurrentWindow();
+  const b = document.getElementById('b'), l = document.getElementById('l');
+
+  let down = null, timer = null;
+  b.addEventListener('mousedown', e => { if (e.button === 0) down = { x: e.screenX, y: e.screenY }; });
+  window.addEventListener('mousemove', e => {
+    if (down && Math.hypot(e.screenX - down.x, e.screenY - down.y) > 4) { down = null; win.startDragging(); }
+  });
+  window.addEventListener('mouseup', e => {
+    if (e.button === 0 && down) { down = null; invoke('convert_active'); }
+  });
+  b.addEventListener('contextmenu', e => { e.preventDefault(); invoke('show_panel'); });
+
+  listen('bubble-state', ({ payload }) => {
+    clearTimeout(timer);
+    b.className = '';
+    b.removeAttribute('data-err');
+    if (payload === 'busy') { b.className = 'busy'; l.textContent = '…'; return; }
+    if (payload === 'done') { b.className = 'done'; l.textContent = '✓'; }
+    else if (payload.startsWith('error:')) { b.className = 'error'; l.textContent = '!'; }
+    timer = setTimeout(() => { b.className = ''; l.textContent = 'अ→A'; }, 1400);
+  });
+</script>
+</body>
+</html>
