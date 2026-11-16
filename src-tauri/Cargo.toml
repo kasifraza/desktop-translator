@@ -15,6 +15,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "default-tls"] }
 arboard = { version = "3", default-features = false }
+keyring = { version = "3", features = ["windows-native"] }
+tauri-plugin-opener = "2"
+sha2 = "0.10"
+base64 = "0.22"
+getrandom = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

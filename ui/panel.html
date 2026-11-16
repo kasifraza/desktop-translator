@@ -62,16 +62,38 @@
   <div>
     <label>Translation engine</label>
     <select id="provider">
-      <option value="auto">Auto — Ollama (local), fallback Google</option>
+      <option value="auto">Auto — Ollama → OpenRouter (if signed in) → Google</option>
       <option value="ollama">Ollama (local, private, offline)</option>
+      <option value="openrouter">OpenRouter — sign in, free models</option>
       <option value="openai">OpenAI-compatible API (Groq / OpenRouter / LM Studio)</option>
       <option value="google">Google free (no grammar fixing)</option>
     </select>
   </div>
   <fieldset id="f-ollama"><legend>Ollama</legend>
     <label>URL</label><input id="ollama_url" />
-    <label>Model</label><input id="ollama_model" />
-    <div class="hint">Install from ollama.com, then run <code>ollama pull qwen2.5:3b</code></div>
+    <label>Model</label><input id="ollama_model" list="ollama-models" />
+    <datalist id="ollama-models">
+      <option value="qwen3:0.6b">~520 MB · tiny, Hindi-aware</option>
+      <option value="gemma3:270m">~290 MB · smallest, basic quality</option>
+      <option value="qwen2.5:0.5b">~400 MB · tiny</option>
+      <option value="gemma3:1b">~815 MB · light</option>
+      <option value="qwen2.5:3b">~1.9 GB · good balance</option>
+      <option value="gemma3:4b">~3.3 GB · best quality</option>
+    </datalist>
+    <div class="hint">Install from ollama.com, then run <code>ollama pull &lt;model&gt;</code></div>
+  </fieldset>
+  <fieldset id="f-openrouter"><legend>OpenRouter account</legend>
+    <div class="row">
+      <span class="grow" id="or-status">Checking…</span>
+      <button class="p" id="or-login">Sign in</button>
+      <button class="s hidden" id="or-cancel">Cancel</button>
+      <button class="s hidden" id="or-logout">Sign out</button>
+    </div>
+    <label>Model</label><input id="openrouter_model" list="or-models" />
+    <datalist id="or-models">
+      <option value="openrouter/free">Auto-pick a free model</option>
+    </datalist>
+    <div class="hint">Free account, no API key to copy. Your key is stored in Windows Credential Manager.</div>
   </fieldset>
   <fieldset id="f-openai"><legend>OpenAI-compatible</legend>
     <label>Base URL</label><input id="openai_base" />
@@ -99,7 +121,7 @@
   const { listen } = window.__TAURI__.event;
   const win = window.__TAURI__.window.getCurrentWindow();
   const $ = id => document.getElementById(id);
-  const FIELDS = ['provider','ollama_url','ollama_model','openai_base','openai_key','openai_model','hotkey','mode'];
+  const FIELDS = ['provider','ollama_url','ollama_model','openai_base','openai_key','openai_model','openrouter_model','hotkey','mode'];
 
   const msg = (el, text, cls = '') => { el.textContent = text; el.className = 'msg grow ' + cls; };
 
@@ -140,6 +162,29 @@
     const p = $('provider').value;
     $('f-ollama').classList.toggle('hidden', !(p === 'auto' || p === 'ollama'));
     $('f-openai').classList.toggle('hidden', p !== 'openai');
+    $('f-openrouter').classList.toggle('hidden', !(p === 'auto' || p === 'openrouter'));
+  };
+
+  // OpenRouter OAuth
+  const show = (id, on) => $(id).classList.toggle('hidden', !on);
+  async function refreshAuth() {
+    const a = await invoke('auth_status');
+    $('or-status').textContent = a.openrouter ? 'Signed in ✓' : 'Not signed in';
+    $('or-status').style.color = a.openrouter ? 'var(--ok)' : 'var(--mute)';
+    show('or-login', !a.openrouter); show('or-logout', a.openrouter); show('or-cancel', false);
+  }
+  $('or-login').onclick = async () => {
+    $('or-status').textContent = 'Waiting for browser sign-in…'; $('or-status').style.color = 'var(--mute)';
+    show('or-login', false); show('or-cancel', true);
+    try { await invoke('oauth_login', { provider: 'openrouter' }); msg($('sm'), 'Signed in to OpenRouter ✓', 'ok'); }
+    catch (e) { msg($('sm'), String(e), 'err'); }
+    refreshAuth();
+  };
+  $('or-cancel').onclick = () => invoke('oauth_cancel');
+  $('or-logout').onclick = async () => {
+    try { await invoke('oauth_logout', { provider: 'openrouter' }); msg($('sm'), 'Signed out', 'ok'); }
+    catch (e) { msg($('sm'), String(e), 'err'); }
+    refreshAuth();
   };
   $('provider').onchange = syncProvider;
 
@@ -147,6 +192,7 @@
     const s = await invoke('get_settings');
     FIELDS.forEach(k => $(k).value = s[k] ?? '');
     syncProvider();
+    refreshAuth();
   })();
 
   $('save').onclick = async () => {

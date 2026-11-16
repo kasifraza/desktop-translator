@@ -31,7 +31,7 @@
         "url": "panel.html",
         "title": "Translate Bubble",
         "width": 420,
-        "height": 480,
+        "height": 580,
         "decorations": false,
         "alwaysOnTop": true,
         "skipTaskbar": true,
@@ -47,6 +47,20 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "icon": ["icons/icon.ico", "icons/icon.png"]
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "shortDescription": "Hindi / Hinglish to clean English, anywhere",
+    "publisher": "Kasif Raza",
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "installMode": "currentUser"
+      }
+    }
   }
 }

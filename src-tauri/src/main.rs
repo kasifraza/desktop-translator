@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod auth;
 mod input;
 mod translate;
 
@@ -32,11 +33,32 @@ fn settings_path(app: &AppHandle) -> Option<PathBuf> {
     app.path().app_config_dir().ok().map(|d| d.join("settings.json"))
 }
 
+/// settings.json never contains secrets; they live in the OS credential store.
+fn write_settings(app: &AppHandle, s: &Settings) -> Result<(), String> {
+    let path = settings_path(app).ok_or("No config directory")?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let mut clean = s.clone();
+    clean.openai_key.clear();
+    let json = serde_json::to_string_pretty(&clean).map_err(|e| e.to_string())?;
+    std::fs::write(path, json).map_err(|e| e.to_string())
+}
+
 fn load_settings(app: &AppHandle) -> Settings {
-    settings_path(app)
+    let mut s: Settings = settings_path(app)
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // Migrate a plain-text key from older versions into the credential store.
+    if !s.openai_key.is_empty() && auth::secret_set("openai", &s.openai_key).is_ok() {
+        let _ = write_settings(app, &s);
+    }
+    if s.openai_key.is_empty() {
+        s.openai_key = auth::secret_get("openai");
+    }
+    s.openrouter_key = auth::secret_get("openrouter");
+    s
 }
 
 fn register_hotkey(app: &AppHandle, hk: &str) -> Result<(), String> {
@@ -150,15 +172,62 @@ fn get_settings(state: State<'_, AppState>) -> Settings {
 }
 
 #[tauri::command]
-fn save_settings(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Result<(), String> {
+fn save_settings(app: AppHandle, state: State<'_, AppState>, mut settings: Settings) -> Result<(), String> {
     register_hotkey(&app, &settings.hotkey)?;
-    let path = settings_path(&app).ok_or("No config directory")?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    auth::secret_set("openai", settings.openai_key.trim())?;
+    write_settings(&app, &settings)?;
+    let mut cur = state.settings.lock().unwrap();
+    settings.openrouter_key = std::mem::take(&mut cur.openrouter_key); // UI never sees it
+    *cur = settings;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct AuthStatus {
+    openrouter: bool,
+}
+
+#[tauri::command]
+fn auth_status(state: State<'_, AppState>) -> AuthStatus {
+    AuthStatus { openrouter: !state.settings.lock().unwrap().openrouter_key.is_empty() }
+}
+
+/// Opens the browser for OpenRouter sign-in, waits for the redirect, stores the key.
+#[tauri::command]
+async fn oauth_login(app: AppHandle, state: State<'_, AppState>, provider: String) -> Result<(), String> {
+    if provider != "openrouter" {
+        return Err(format!("Unknown provider '{provider}'"));
     }
-    let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
-    std::fs::write(path, json).map_err(|e| e.to_string())?;
-    *state.settings.lock().unwrap() = settings;
+    let pending = auth::openrouter_begin()?;
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(pending.auth_url.clone(), None::<&str>)
+        .map_err(|e| format!("Could not open browser: {e}"))?;
+    let (pending, code) = tauri::async_runtime::spawn_blocking(move || {
+        let code = auth::wait_for_code(&pending);
+        (pending, code)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let key = auth::openrouter_exchange(&state.client, &pending, &code?).await?;
+    auth::secret_set("openrouter", &key)?;
+    state.settings.lock().unwrap().openrouter_key = key;
+    show_panel_impl(&app); // bring the app back in front of the browser
+    Ok(())
+}
+
+#[tauri::command]
+fn oauth_cancel() {
+    auth::cancel_logins();
+}
+
+#[tauri::command]
+fn oauth_logout(state: State<'_, AppState>, provider: String) -> Result<(), String> {
+    if provider != "openrouter" {
+        return Err(format!("Unknown provider '{provider}'"));
+    }
+    auth::secret_set("openrouter", "")?;
+    state.settings.lock().unwrap().openrouter_key.clear();
     Ok(())
 }
 
@@ -185,6 +254,7 @@ fn main() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show_panel_impl(app);
         }))
+        .plugin(tauri_plugin_opener::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {
@@ -205,6 +275,10 @@ fn main() {
             copy_text,
             get_settings,
             save_settings,
+            auth_status,
+            oauth_login,
+            oauth_cancel,
+            oauth_logout,
             show_panel,
             quit_app
         ])

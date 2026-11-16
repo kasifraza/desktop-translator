@@ -7,13 +7,18 @@ use serde_json::{json, Value};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// "auto" (Ollama, fall back to Google) | "ollama" | "openai" | "google"
+    /// "auto" (Ollama -> OpenRouter if signed in -> Google) | "ollama" | "openrouter" | "openai" | "google"
     pub provider: String,
     pub ollama_url: String,
     pub ollama_model: String,
     pub openai_base: String,
+    /// Lives in the OS credential store; only sent between UI and core, never written to settings.json.
     pub openai_key: String,
     pub openai_model: String,
+    pub openrouter_model: String,
+    /// OAuth key from OpenRouter sign-in. Runtime only (credential store), never sent to the UI.
+    #[serde(skip)]
+    pub openrouter_key: String,
     pub hotkey: String,
     /// "replace" (paste back into the field) | "copy" (clipboard + panel only)
     pub mode: String,
@@ -28,6 +33,8 @@ impl Default for Settings {
             openai_base: "https://api.groq.com/openai/v1".into(),
             openai_key: String::new(),
             openai_model: "llama-3.1-8b-instant".into(),
+            openrouter_model: "openrouter/free".into(),
+            openrouter_key: String::new(),
             hotkey: "Ctrl+Shift+Space".into(),
             mode: "replace".into(),
         }
@@ -70,6 +77,14 @@ fn messages(text: &str) -> Value {
 
 fn clean(out: &str, input: &str) -> String {
     let mut s = out.trim().to_string();
+    // Reasoning models (qwen3, deepseek-r1, ...) may emit their thinking inline.
+    while let Some(start) = s.find("<think>") {
+        match s[start..].find("</think>") {
+            Some(end) => s.replace_range(start..start + end + "</think>".len(), ""),
+            None => s.truncate(start),
+        }
+    }
+    s = s.trim().to_string();
     for tag in ["<text>", "</text>"] {
         s = s.replace(tag, "");
     }
@@ -88,37 +103,46 @@ fn clean(out: &str, input: &str) -> String {
 
 async fn ollama(c: &reqwest::Client, s: &Settings, text: &str) -> Result<String, String> {
     let url = format!("{}/api/chat", s.ollama_url.trim_end_matches('/'));
-    let body = json!({
+    let mut body = json!({
         "model": s.ollama_model,
         "messages": messages(text),
         "stream": false,
+        "think": false, // skip slow reasoning on qwen3 & co.
         "keep_alive": "30m",
         "options": {"temperature": 0.2}
     });
-    let r = c.post(url).json(&body).send().await.map_err(|e| {
-        if e.is_connect() {
-            "Ollama is not running".to_string()
-        } else {
-            e.to_string()
+    let v = loop {
+        let r = c.post(&url).json(&body).send().await.map_err(|e| {
+            if e.is_connect() {
+                "Ollama is not running".to_string()
+            } else {
+                e.to_string()
+            }
+        })?;
+        let status = r.status();
+        let v: Value = r.json().await.map_err(|e| e.to_string())?;
+        if status.is_success() {
+            break v;
         }
-    })?;
-    let status = r.status();
-    let v: Value = r.json().await.map_err(|e| e.to_string())?;
-    if !status.is_success() {
         let msg = v["error"].as_str().unwrap_or("request failed");
+        // Older Ollama / non-thinking models may reject the `think` flag.
+        if msg.contains("think") && body.get("think").is_some() {
+            body.as_object_mut().unwrap().remove("think");
+            continue;
+        }
         return Err(format!("Ollama {status}: {msg}"));
-    }
+    };
     v["message"]["content"]
         .as_str()
         .map(|o| clean(o, text))
         .ok_or_else(|| "Ollama: empty response".into())
 }
 
-async fn openai(c: &reqwest::Client, s: &Settings, text: &str) -> Result<String, String> {
-    let url = format!("{}/chat/completions", s.openai_base.trim_end_matches('/'));
-    let mut body = json!({"model": s.openai_model, "messages": messages(text), "temperature": 0.2});
+async fn openai(c: &reqwest::Client, base: &str, key: &str, model: &str, text: &str) -> Result<String, String> {
+    let url = format!("{}/chat/completions", base.trim_end_matches('/'));
+    let mut body = json!({"model": model, "messages": messages(text), "temperature": 0.2});
     // Reasoning models (gpt-5*, o-series): minimal reasoning = much faster, cheaper.
-    let m = s.openai_model.to_ascii_lowercase();
+    let m = model.to_ascii_lowercase();
     if (m.starts_with("gpt-5") && !m.contains("chat")) || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") {
         body["reasoning_effort"] = json!(if m.starts_with("gpt-5") { "minimal" } else { "low" });
     }
@@ -128,9 +152,13 @@ async fn openai(c: &reqwest::Client, s: &Settings, text: &str) -> Result<String,
     let mut tries = 0;
     let v = loop {
         tries += 1;
-        let mut req = c.post(&url).json(&body);
-        if !s.openai_key.trim().is_empty() {
-            req = req.bearer_auth(s.openai_key.trim());
+        let mut req = c
+            .post(&url)
+            .json(&body)
+            .header("HTTP-Referer", "https://github.com/kasifraza/desktop-translator")
+            .header("X-Title", "Translate Bubble");
+        if !key.trim().is_empty() {
+            req = req.bearer_auth(key.trim());
         }
         let r = req.send().await.map_err(|e| e.to_string())?;
         let status = r.status();
@@ -186,17 +214,40 @@ async fn google(c: &reqwest::Client, text: &str) -> Result<String, String> {
     Ok(out.trim().to_string())
 }
 
+async fn openrouter(c: &reqwest::Client, s: &Settings, text: &str) -> Result<String, String> {
+    if s.openrouter_key.is_empty() {
+        return Err("Not signed in to OpenRouter (Settings -> Sign in)".into());
+    }
+    let model = if s.openrouter_model.trim().is_empty() { "openrouter/free" } else { s.openrouter_model.trim() };
+    openai(c, "https://openrouter.ai/api/v1", &s.openrouter_key, model, text).await
+}
+
 pub async fn translate(c: &reqwest::Client, s: &Settings, text: &str) -> Result<String, String> {
     match s.provider.as_str() {
         "ollama" => ollama(c, s, text).await,
-        "openai" => openai(c, s, text).await,
+        "openai" => openai(c, &s.openai_base, &s.openai_key, &s.openai_model, text).await,
+        "openrouter" => openrouter(c, s, text).await,
         "google" => google(c, text).await,
-        _ => match ollama(c, s, text).await {
-            Ok(t) => Ok(t),
-            Err(oe) => google(c, text)
-                .await
-                .map_err(|ge| format!("Ollama: {oe} | Google: {ge}")),
-        },
+        _ => {
+            let mut errs = Vec::new();
+            match ollama(c, s, text).await {
+                Ok(t) => return Ok(t),
+                Err(e) => errs.push(format!("Ollama: {e}")),
+            }
+            if !s.openrouter_key.is_empty() {
+                match openrouter(c, s, text).await {
+                    Ok(t) => return Ok(t),
+                    Err(e) => errs.push(format!("OpenRouter: {e}")),
+                }
+            }
+            match google(c, text).await {
+                Ok(t) => Ok(t),
+                Err(e) => {
+                    errs.push(format!("Google: {e}"));
+                    Err(errs.join(" | "))
+                }
+            }
+        }
     }
 }
 
@@ -210,6 +261,10 @@ mod tests {
         assert_eq!(clean("Translation: \"Hi\"", "hi"), "Hi");
         assert_eq!(clean("\"Hi\"", "\"hi\""), "\"Hi\"");
         assert_eq!(clean("नमस्ते", "x"), "नमस्ते");
+        assert_eq!(clean("<think>hmm
+ok</think>
+Hello.", "x"), "Hello.");
+        assert_eq!(clean("Hi <think>unfinished", "x"), "Hi");
     }
 
     /// Auto mode with no Ollama running must fall back to Google. Network test.
@@ -232,7 +287,11 @@ mod tests {
     fn saved_settings_provider() {
         let path = std::path::Path::new(&std::env::var("APPDATA").unwrap())
             .join("tech.openforge.translatebubble/settings.json");
-        let s: Settings = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let mut s: Settings = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        if s.openai_key.is_empty() {
+            s.openai_key = crate::auth::secret_get("openai");
+        }
+        s.openrouter_key = crate::auth::secret_get("openrouter");
         let c = reqwest::Client::new();
         let out = tauri::async_runtime::block_on(translate(&c, &s, "kal meeting h kya 5 baje? mujhe thoda late hoga"));
         println!("provider={} model={} result: {out:?}", s.provider, s.openai_model);

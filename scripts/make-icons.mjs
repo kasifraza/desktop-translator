@@ -1,8 +1,9 @@
-// Generates src-tauri/icons/icon.png (256) and icon.ico (PNG-in-ICO). No dependencies.
+// Renders the 1024px master icon to scripts/icon-source.png (no deps).
+// Then run `npx tauri icon scripts/icon-source.png` to produce every size/format.
 import { deflateSync } from "node:zlib";
-import { writeFileSync, mkdirSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 
-const S = 256;
+const S = Number(process.argv[2] || 1024);
 const px = Buffer.alloc(S * S * 4);
 
 function set(x, y, r, g, b, a) {
@@ -53,14 +54,5 @@ const png = Buffer.concat([
   chunk("IHDR", ihdr), chunk("IDAT", deflateSync(raw, { level: 9 })), chunk("IEND", Buffer.alloc(0)),
 ]);
 
-const header = Buffer.alloc(6); header.writeUInt16LE(0, 0); header.writeUInt16LE(1, 2); header.writeUInt16LE(1, 4);
-const entry = Buffer.alloc(16);
-entry[0] = 0; entry[1] = 0; entry[2] = 0; entry[3] = 0; // 0 = 256px
-entry.writeUInt16LE(1, 4); entry.writeUInt16LE(32, 6);
-entry.writeUInt32LE(png.length, 8); entry.writeUInt32LE(22, 12);
-
-const out = new URL("../src-tauri/icons/", import.meta.url);
-mkdirSync(out, { recursive: true });
-writeFileSync(new URL("icon.png", out), png);
-writeFileSync(new URL("icon.ico", out), Buffer.concat([header, entry, png]));
-console.log("icons written");
+writeFileSync(new URL("./icon-source.png", import.meta.url), png);
+console.log("scripts/icon-source.png written (" + S + "px)");

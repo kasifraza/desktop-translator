@@ -45,7 +45,9 @@ It works the same in a browser, desktop app, chat box, email or prompt box.
 | ✂️ **Selection aware** | Select part of your text to convert only that part. With nothing selected, the whole box is converted. |
 | 📋 **Copy mode** | Instead of replacing, it can just copy the result and show it in the panel. |
 | 📝 **Manual panel** | Right-click the bubble to type or paste text, convert it, and copy the result. |
-| 🔌 **Pluggable engines** | Ollama (local), any OpenAI-compatible API, or Google's free fallback. |
+| 🔌 **Pluggable engines** | Ollama (local), OpenRouter (sign in), any OpenAI-compatible API, or Google's free fallback. |
+| 🔐 **OAuth sign-in** | Sign in to OpenRouter in your browser. You don't need to copy an API key. |
+| 🗝️ **Secure secrets** | API keys and tokens are kept in Windows Credential Manager, not in config files. |
 | 🖥️ **Tray icon** | Show or hide the bubble, open settings, quit. |
 
 ---
@@ -77,11 +79,34 @@ It works the same in a browser, desktop app, chat box, email or prompt box.
 
 | Engine | Cost | Privacy | Grammar fix | Setup |
 |---|---|---|---|---|
-| **Ollama** (local) | Free | 100% offline | ✅ | Install [Ollama](https://ollama.com), then run `ollama pull qwen2.5:3b` |
+| **Ollama** (local) | Free | 100% offline | ✅ | Install [Ollama](https://ollama.com), then run `ollama pull qwen3:0.6b` |
+| **OpenRouter** (OAuth) | Free models | Sent to OpenRouter | ✅ | Settings → **Sign in** (browser) |
 | **OpenAI-compatible** | Free tiers or paid | Sent to the provider | ✅ | Base URL, API key, model |
 | **Google** (fallback) | Free | Sent to Google | ❌ translate only | None |
 
-**Auto** (the default) uses Ollama and falls back to Google if Ollama isn't running.
+**Auto** (the default) tries Ollama first, then OpenRouter if you're signed in, then Google.
+
+### OpenRouter sign-in (OAuth)
+Many free API-key programs have closed. OpenRouter supports OAuth with PKCE for desktop apps:
+
+1. Click **Sign in** in Settings. Your browser opens openrouter.ai.
+2. Sign in or create a free account, then click **Authorize**.
+3. The browser redirects to a temporary local address (`http://localhost:<random port>/callback`). The app receives the code and exchanges it for a personal key.
+4. The key is stored in Windows Credential Manager under `tech.openforge.translatebubble`.
+
+The default model `openrouter/free` automatically picks one of OpenRouter's free models. Click **Sign out** to delete the stored key.
+
+### Small local models (Ollama)
+| Model | Download | Notes |
+|---|---|---|
+| `gemma3:270m` | ~290 MB | Smallest. OK for simple Hindi; weak on Hinglish. |
+| `qwen2.5:0.5b` | ~400 MB | Tiny, multilingual |
+| `qwen3:0.6b` | ~520 MB | **Best tiny pick.** Lists Hindi support. Thinking is turned off automatically. |
+| `gemma3:1b` | ~815 MB | Noticeably better grammar |
+| `qwen2.5:3b` | ~1.9 GB | Good balance |
+| `gemma3:4b` | ~3.3 GB | Best local quality |
+
+These models run at roughly 1–1.5× their download size in RAM.
 
 Example OpenAI-compatible setups:
 
@@ -103,7 +128,7 @@ For better local quality, try `qwen2.5:7b` or `llama3.1:8b`.
 3. Launch **Translate Bubble**. The bubble appears on the right edge of your screen.
 4. Right-click the bubble, open **Settings**, choose an engine, and click **Save**.
 
-Settings are stored in `%APPDATA%\tech.openforge.translatebubble\settings.json`. API keys are stored there in plain text, on your machine only.
+Settings are stored in `%APPDATA%\tech.openforge.translatebubble\settings.json`. API keys and OAuth tokens are **not** stored there; they are kept in Windows Credential Manager.
 
 ### Usage
 
@@ -165,17 +190,19 @@ cargo test -- --include-ignored
 ├── src-tauri/
 │   ├── src/
 │   │   ├── main.rs       # windows, tray, hotkey, commands, convert flow
+│   │   ├── auth.rs       # OAuth (PKCE + loopback) and Credential Manager
 │   │   ├── input.rs      # Win32: focus tracking, SendInput, clipboard
 │   │   └── translate.rs  # prompt + Ollama / OpenAI-compatible / Google
 │   ├── tauri.conf.json   # window + bundle config
 │   └── capabilities/     # Tauri permissions
-└── scripts/make-icons.mjs  # generates the app icon (no dependencies)
+└── scripts/make-icons.mjs  # renders the 1024px master icon (no dependencies)
 ```
 
 ### Tech stack
 - **Tauri v2** with Rust for the backend and the system WebView2 for the UI
 - **Vanilla HTML, CSS and JS** with no framework and no bundler
-- `windows-sys` for focus tracking and key presses, `arboard` for the clipboard, `reqwest` for HTTP
+- `windows-sys` for focus tracking and key presses, `arboard` for the clipboard, `reqwest` for HTTP, `keyring` for secrets
+- Icons: `node scripts/make-icons.mjs && npx tauri icon scripts/icon-source.png`
 - Tauri plugins: `global-shortcut` and `single-instance`
 - Release profile: `opt-level="s"`, LTO, stripped binary
 
