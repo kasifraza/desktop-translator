@@ -7,7 +7,8 @@ use serde_json::{json, Value};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// "auto" (Ollama -> OpenRouter if signed in -> Google) | "ollama" | "openrouter" | "openai" | "google"
+    /// "auto" (Ollama -> Copilot / OpenRouter if signed in -> Google)
+    /// | "ollama" | "copilot" | "openrouter" | "opencode" | "openai" | "google"
     pub provider: String,
     pub ollama_url: String,
     pub ollama_model: String,
@@ -19,6 +20,13 @@ pub struct Settings {
     /// OAuth key from OpenRouter sign-in. Runtime only (credential store), never sent to the UI.
     #[serde(skip)]
     pub openrouter_key: String,
+    pub copilot_model: String,
+    /// GitHub token from Copilot device sign-in. Runtime only (credential store).
+    #[serde(skip)]
+    pub github_token: String,
+    /// OpenCode Zen API key. Like openai_key: credential store, never in settings.json.
+    pub opencode_key: String,
+    pub opencode_model: String,
     pub hotkey: String,
     /// "replace" (paste back into the field) | "copy" (clipboard + panel only)
     pub mode: String,
@@ -35,6 +43,10 @@ impl Default for Settings {
             openai_model: "llama-3.1-8b-instant".into(),
             openrouter_model: "openrouter/free".into(),
             openrouter_key: String::new(),
+            copilot_model: "gpt-4.1".into(),
+            github_token: String::new(),
+            opencode_key: String::new(),
+            opencode_model: "big-pickle".into(),
             hotkey: "Ctrl+Shift+Space".into(),
             mode: "replace".into(),
         }
@@ -139,6 +151,17 @@ async fn ollama(c: &reqwest::Client, s: &Settings, text: &str) -> Result<String,
 }
 
 async fn openai(c: &reqwest::Client, base: &str, key: &str, model: &str, text: &str) -> Result<String, String> {
+    openai_ext(c, base, key, model, text, &[]).await
+}
+
+async fn openai_ext(
+    c: &reqwest::Client,
+    base: &str,
+    key: &str,
+    model: &str,
+    text: &str,
+    extra: &[(&str, &str)],
+) -> Result<String, String> {
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
     let mut body = json!({"model": model, "messages": messages(text), "temperature": 0.2});
     // Reasoning models (gpt-5*, o-series): minimal reasoning = much faster, cheaper.
@@ -157,6 +180,9 @@ async fn openai(c: &reqwest::Client, base: &str, key: &str, model: &str, text: &
             .json(&body)
             .header("HTTP-Referer", "https://github.com/kasifraza/desktop-translator")
             .header("X-Title", "Translate Bubble");
+        for (k, v) in extra {
+            req = req.header(*k, *v);
+        }
         if !key.trim().is_empty() {
             req = req.bearer_auth(key.trim());
         }
@@ -214,6 +240,26 @@ async fn google(c: &reqwest::Client, text: &str) -> Result<String, String> {
     Ok(out.trim().to_string())
 }
 
+async fn copilot(c: &reqwest::Client, s: &Settings, text: &str) -> Result<String, String> {
+    if s.github_token.is_empty() {
+        return Err("Not signed in to GitHub Copilot (Settings -> Sign in)".into());
+    }
+    let token = crate::auth::copilot_token(c, &s.github_token).await?;
+    let model = if s.copilot_model.trim().is_empty() { "gpt-4.1" } else { s.copilot_model.trim() };
+    let mut h: Vec<(&str, &str)> = crate::auth::COPILOT_HEADERS.to_vec();
+    h.push(("Openai-Intent", "conversation-edits"));
+    h.push(("X-Initiator", "user"));
+    openai_ext(c, "https://api.githubcopilot.com", &token, model, text, &h).await
+}
+
+async fn opencode(c: &reqwest::Client, s: &Settings, text: &str) -> Result<String, String> {
+    if s.opencode_key.trim().is_empty() {
+        return Err("No OpenCode Zen API key (Settings -> Get key)".into());
+    }
+    let model = if s.opencode_model.trim().is_empty() { "big-pickle" } else { s.opencode_model.trim() };
+    openai(c, "https://opencode.ai/zen/v1", &s.opencode_key, model, text).await
+}
+
 async fn openrouter(c: &reqwest::Client, s: &Settings, text: &str) -> Result<String, String> {
     if s.openrouter_key.is_empty() {
         return Err("Not signed in to OpenRouter (Settings -> Sign in)".into());
@@ -227,12 +273,20 @@ pub async fn translate(c: &reqwest::Client, s: &Settings, text: &str) -> Result<
         "ollama" => ollama(c, s, text).await,
         "openai" => openai(c, &s.openai_base, &s.openai_key, &s.openai_model, text).await,
         "openrouter" => openrouter(c, s, text).await,
+        "copilot" => copilot(c, s, text).await,
+        "opencode" => opencode(c, s, text).await,
         "google" => google(c, text).await,
         _ => {
             let mut errs = Vec::new();
             match ollama(c, s, text).await {
                 Ok(t) => return Ok(t),
                 Err(e) => errs.push(format!("Ollama: {e}")),
+            }
+            if !s.github_token.is_empty() {
+                match copilot(c, s, text).await {
+                    Ok(t) => return Ok(t),
+                    Err(e) => errs.push(format!("Copilot: {e}")),
+                }
             }
             if !s.openrouter_key.is_empty() {
                 match openrouter(c, s, text).await {
@@ -292,6 +346,8 @@ Hello.", "x"), "Hello.");
             s.openai_key = crate::auth::secret_get("openai");
         }
         s.openrouter_key = crate::auth::secret_get("openrouter");
+        s.github_token = crate::auth::secret_get("github-copilot");
+        s.opencode_key = crate::auth::secret_get("opencode");
         let c = reqwest::Client::new();
         let out = tauri::async_runtime::block_on(translate(&c, &s, "kal meeting h kya 5 baje? mujhe thoda late hoga"));
         println!("provider={} model={} result: {out:?}", s.provider, s.openai_model);

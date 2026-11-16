@@ -31,7 +31,7 @@
         "url": "panel.html",
         "title": "Translate Bubble",
         "width": 420,
-        "height": 580,
+        "height": 640,
         "decorations": false,
         "alwaysOnTop": true,
         "skipTaskbar": true,

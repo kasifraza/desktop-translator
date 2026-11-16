@@ -62,9 +62,11 @@
   <div>
     <label>Translation engine</label>
     <select id="provider">
-      <option value="auto">Auto — Ollama → OpenRouter (if signed in) → Google</option>
+      <option value="auto">Auto — Ollama → Copilot / OpenRouter (if signed in) → Google</option>
       <option value="ollama">Ollama (local, private, offline)</option>
+      <option value="copilot">GitHub Copilot — sign in (unofficial)</option>
       <option value="openrouter">OpenRouter — sign in, free models</option>
+      <option value="opencode">OpenCode Zen — API key</option>
       <option value="openai">OpenAI-compatible API (Groq / OpenRouter / LM Studio)</option>
       <option value="google">Google free (no grammar fixing)</option>
     </select>
@@ -81,6 +83,35 @@
       <option value="gemma3:4b">~3.3 GB · best quality</option>
     </datalist>
     <div class="hint">Install from ollama.com, then run <code>ollama pull &lt;model&gt;</code></div>
+  </fieldset>
+  <fieldset id="f-copilot"><legend>GitHub Copilot account</legend>
+    <div class="row">
+      <span class="grow" id="cp-status">Checking…</span>
+      <button class="p" id="cp-login">Sign in</button>
+      <button class="s hidden" id="cp-cancel">Cancel</button>
+      <button class="s hidden" id="cp-logout">Sign out</button>
+    </div>
+    <div class="hidden" id="cp-code-box" style="margin-top:8px">
+      Enter this code on GitHub (already copied):
+      <div style="font:600 22px Consolas,monospace;letter-spacing:3px;margin:4px 0" id="cp-code"></div>
+    </div>
+    <label>Model</label><input id="copilot_model" list="cp-models" />
+    <datalist id="cp-models">
+      <option value="gpt-4.1">Included in all plans</option>
+      <option value="gpt-4o">Included in all plans</option>
+      <option value="gpt-5-mini">Included in paid plans</option>
+      <option value="claude-sonnet-4.5">Uses premium requests</option>
+    </datalist>
+    <div class="hint" style="color:#fbbf24">Unofficial: uses the same internal Copilot API as OpenCode. GitHub may block it or flag the account. Requires a Copilot plan (Free works).</div>
+  </fieldset>
+  <fieldset id="f-opencode"><legend>OpenCode Zen</legend>
+    <div class="row">
+      <div class="grow"><label>API key</label><input id="opencode_key" type="password" /></div>
+      <button class="s" id="oc-getkey" style="align-self:flex-end">Get key</button>
+    </div>
+    <label>Model</label><input id="opencode_model" list="oc-models" />
+    <datalist id="oc-models"></datalist>
+    <div class="hint">Sign in at opencode.ai/auth, add billing and copy your key. Free models may only work inside the OpenCode app.</div>
   </fieldset>
   <fieldset id="f-openrouter"><legend>OpenRouter account</legend>
     <div class="row">
@@ -121,7 +152,7 @@
   const { listen } = window.__TAURI__.event;
   const win = window.__TAURI__.window.getCurrentWindow();
   const $ = id => document.getElementById(id);
-  const FIELDS = ['provider','ollama_url','ollama_model','openai_base','openai_key','openai_model','openrouter_model','hotkey','mode'];
+  const FIELDS = ['provider','ollama_url','ollama_model','openai_base','openai_key','openai_model','openrouter_model','copilot_model','opencode_key','opencode_model','hotkey','mode'];
 
   const msg = (el, text, cls = '') => { el.textContent = text; el.className = 'msg grow ' + cls; };
 
@@ -163,12 +194,28 @@
     $('f-ollama').classList.toggle('hidden', !(p === 'auto' || p === 'ollama'));
     $('f-openai').classList.toggle('hidden', p !== 'openai');
     $('f-openrouter').classList.toggle('hidden', !(p === 'auto' || p === 'openrouter'));
+    $('f-copilot').classList.toggle('hidden', !(p === 'auto' || p === 'copilot'));
+    $('f-opencode').classList.toggle('hidden', p !== 'opencode');
+    if (p === 'opencode') loadZenModels();
   };
+
+  let zenLoaded = false;
+  async function loadZenModels() {
+    if (zenLoaded) return; zenLoaded = true;
+    try {
+      const j = await (await fetch('https://opencode.ai/zen/v1/models')).json();
+      $('oc-models').innerHTML = (j.data || []).map(m => `<option value="${m.id}">${m.id.endsWith('-free') || m.id === 'big-pickle' ? 'free' : ''}</option>`).join('');
+    } catch { zenLoaded = false; }
+  }
+  $('oc-getkey').onclick = () => invoke('open_link', { url: 'https://opencode.ai/auth' });
 
   // OpenRouter OAuth
   const show = (id, on) => $(id).classList.toggle('hidden', !on);
   async function refreshAuth() {
     const a = await invoke('auth_status');
+    $('cp-status').textContent = a.copilot ? 'Signed in ✓' : 'Not signed in';
+    $('cp-status').style.color = a.copilot ? 'var(--ok)' : 'var(--mute)';
+    show('cp-login', !a.copilot); show('cp-logout', a.copilot); show('cp-cancel', false); show('cp-code-box', false);
     $('or-status').textContent = a.openrouter ? 'Signed in ✓' : 'Not signed in';
     $('or-status').style.color = a.openrouter ? 'var(--ok)' : 'var(--mute)';
     show('or-login', !a.openrouter); show('or-logout', a.openrouter); show('or-cancel', false);
@@ -181,6 +228,25 @@
     refreshAuth();
   };
   $('or-cancel').onclick = () => invoke('oauth_cancel');
+
+  // GitHub Copilot device flow
+  listen('device-code', ({ payload }) => {
+    $('cp-code').textContent = payload.user_code; show('cp-code-box', true);
+    $('cp-status').textContent = 'Waiting for GitHub…';
+  });
+  $('cp-login').onclick = async () => {
+    $('cp-status').textContent = 'Starting…'; $('cp-status').style.color = 'var(--mute)';
+    show('cp-login', false); show('cp-cancel', true);
+    try { await invoke('oauth_login', { provider: 'copilot' }); msg($('sm'), 'Signed in to GitHub Copilot ✓', 'ok'); }
+    catch (e) { msg($('sm'), String(e), 'err'); }
+    refreshAuth();
+  };
+  $('cp-cancel').onclick = () => invoke('oauth_cancel');
+  $('cp-logout').onclick = async () => {
+    try { await invoke('oauth_logout', { provider: 'copilot' }); msg($('sm'), 'Signed out', 'ok'); }
+    catch (e) { msg($('sm'), String(e), 'err'); }
+    refreshAuth();
+  };
   $('or-logout').onclick = async () => {
     try { await invoke('oauth_logout', { provider: 'openrouter' }); msg($('sm'), 'Signed out', 'ok'); }
     catch (e) { msg($('sm'), String(e), 'err'); }

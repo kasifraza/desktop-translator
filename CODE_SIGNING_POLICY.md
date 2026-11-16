@@ -24,11 +24,13 @@ This program will not transfer any information to other networked systems unless
 
 - **Translation:** text is sent only when you click the bubble, press the hotkey or click **Convert**, and only to the engine you selected in Settings:
   - **Ollama:** your own local server; nothing leaves your computer.
+  - **GitHub Copilot:** api.github.com and api.githubcopilot.com ([GitHub privacy statement](https://docs.github.com/site-policy/privacy-policies/github-general-privacy-statement)).
   - **OpenRouter:** openrouter.ai ([privacy policy](https://openrouter.ai/privacy)).
+  - **OpenCode Zen:** opencode.ai.
   - **OpenAI-compatible:** the base URL you entered.
   - **Google:** translate.googleapis.com ([privacy policy](https://policies.google.com/privacy)).
-  - **Auto:** tries Ollama, then OpenRouter if you're signed in, then Google. To prevent fallback to cloud services, select **Ollama** instead of **Auto**.
-- **Sign-in:** OpenRouter sign-in opens openrouter.ai in your browser at your request.
+  - **Auto:** tries Ollama, then Copilot and OpenRouter if you're signed in, then Google. To prevent fallback to cloud services, select **Ollama** instead of **Auto**.
+- **Sign-in:** at your request, OpenRouter sign-in opens openrouter.ai in your browser, and GitHub Copilot sign-in opens github.com/login/device.
 - **No telemetry:** no analytics, crash reporting, or update checks.
 - **Local storage:** settings are stored in `%APPDATA%\tech.openforge.translatebubble\`, and API keys and tokens are stored in Windows Credential Manager.
 

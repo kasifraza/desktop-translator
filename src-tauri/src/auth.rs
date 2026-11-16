@@ -194,6 +194,17 @@ mod tests {
         assert_eq!(urldecode("abc%2"), "abc%2");
     }
 
+    /// Network: GitHub must hand out a device code for the Copilot client ID.
+    #[test]
+    #[ignore]
+    fn copilot_device_code_issued() {
+        let c = reqwest::Client::new();
+        let d = tauri::async_runtime::block_on(copilot_device_start(&c)).unwrap();
+        println!("user_code={} uri={}", d.user_code, d.verification_uri);
+        assert!(d.verification_uri.starts_with("https://github.com/login/device"));
+        assert_eq!(d.user_code.len(), 9);
+    }
+
     #[test]
     fn credential_store_roundtrip() {
         secret_set("unit-test", "s3cret").unwrap();
@@ -209,5 +220,138 @@ mod tests {
         assert!(p.auth_url.contains("code_challenge_method=S256"));
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(p.verifier.as_bytes()));
         assert!(p.auth_url.contains(&challenge));
+    }
+}
+
+// ---------- GitHub Copilot (unofficial; same flow as OpenCode's copilot plugin) ----------
+//
+// GitHub has no official Copilot API for third-party apps. Like OpenCode, we use
+// the VS Code Copilot client ID for GitHub's device flow, then exchange the GitHub
+// token for a short-lived Copilot token via an internal endpoint. This may break
+// or be restricted by GitHub at any time.
+
+pub const COPILOT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
+pub const COPILOT_HEADERS: [(&str, &str); 4] = [
+    ("User-Agent", "GitHubCopilotChat/0.35.0"),
+    ("Editor-Version", "vscode/1.107.0"),
+    ("Editor-Plugin-Version", "copilot-chat/0.35.0"),
+    ("Copilot-Integration-Id", "vscode-chat"),
+];
+
+#[derive(serde::Serialize, Clone)]
+pub struct DeviceCode {
+    pub user_code: String,
+    pub verification_uri: String,
+    #[serde(skip)]
+    pub device_code: String,
+    #[serde(skip)]
+    pub interval: u64,
+    #[serde(skip)]
+    pub gen: u64,
+}
+
+pub async fn copilot_device_start(c: &reqwest::Client) -> Result<DeviceCode, String> {
+    let v: serde_json::Value = c
+        .post("https://github.com/login/device/code")
+        .header("Accept", "application/json")
+        .header("User-Agent", COPILOT_HEADERS[0].1)
+        .json(&serde_json::json!({"client_id": COPILOT_CLIENT_ID, "scope": "read:user"}))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    let s = |k: &str| v[k].as_str().map(str::to_string);
+    match (s("device_code"), s("user_code"), s("verification_uri")) {
+        (Some(device_code), Some(user_code), Some(verification_uri)) => Ok(DeviceCode {
+            user_code,
+            verification_uri,
+            device_code,
+            interval: v["interval"].as_u64().unwrap_or(5).max(1),
+            gen: LOGIN_GEN.fetch_add(1, Ordering::SeqCst) + 1,
+        }),
+        _ => Err(format!("GitHub device login failed: {}", v["error_description"].as_str().unwrap_or("unexpected response"))),
+    }
+}
+
+/// Polls until the user enters the code on github.com. Returns the GitHub OAuth token.
+pub async fn copilot_device_poll(c: &reqwest::Client, d: &DeviceCode) -> Result<String, String> {
+    let mut interval = d.interval;
+    let deadline = Instant::now() + Duration::from_secs(900);
+    loop {
+        tokio_sleep(Duration::from_secs(interval)).await;
+        if LOGIN_GEN.load(Ordering::SeqCst) != d.gen {
+            return Err("Sign-in cancelled".into());
+        }
+        if Instant::now() > deadline {
+            return Err("Sign-in timed out".into());
+        }
+        let v: serde_json::Value = c
+            .post("https://github.com/login/oauth/access_token")
+            .header("Accept", "application/json")
+            .header("User-Agent", COPILOT_HEADERS[0].1)
+            .json(&serde_json::json!({
+                "client_id": COPILOT_CLIENT_ID,
+                "device_code": d.device_code,
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code"
+            }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(t) = v["access_token"].as_str() {
+            return Ok(t.to_string());
+        }
+        match v["error"].as_str() {
+            Some("authorization_pending") => {}
+            Some("slow_down") => interval += 5,
+            Some("expired_token") => return Err("The code expired. Try again.".into()),
+            Some("access_denied") => return Err("Sign-in was cancelled on GitHub".into()),
+            Some(e) => return Err(format!("GitHub: {e}")),
+            None => {}
+        }
+    }
+}
+
+async fn tokio_sleep(d: Duration) {
+    let _ = tauri::async_runtime::spawn_blocking(move || std::thread::sleep(d)).await;
+}
+
+/// Exchanges the stored GitHub token for a short-lived Copilot API token (cached).
+pub async fn copilot_token(c: &reqwest::Client, github_token: &str) -> Result<String, String> {
+    static CACHE: std::sync::Mutex<Option<(String, String, u64)>> = std::sync::Mutex::new(None);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Some((gh, tok, exp)) = CACHE.lock().unwrap().as_ref() {
+        if gh == github_token && *exp > now + 300 {
+            return Ok(tok.clone());
+        }
+    }
+    let mut req = c
+        .get("https://api.github.com/copilot_internal/v2/token")
+        .header("Accept", "application/json")
+        .bearer_auth(github_token);
+    for (k, v) in COPILOT_HEADERS {
+        req = req.header(k, v);
+    }
+    let r = req.send().await.map_err(|e| e.to_string())?;
+    let status = r.status();
+    let v: serde_json::Value = r.json().await.unwrap_or_default();
+    match v["token"].as_str() {
+        Some(t) if status.is_success() => {
+            let exp = v["expires_at"].as_u64().unwrap_or(now + 1500);
+            *CACHE.lock().unwrap() = Some((github_token.to_string(), t.to_string(), exp));
+            Ok(t.to_string())
+        }
+        _ if status.as_u16() == 401 => Err("Copilot sign-in expired. Sign in again.".into()),
+        _ if status.as_u16() == 403 || status.as_u16() == 404 => {
+            Err("No active GitHub Copilot subscription on this account (Copilot Free counts).".into())
+        }
+        _ => Err(format!("Copilot token {status}: {}", v["message"].as_str().unwrap_or("failed"))),
     }
 }

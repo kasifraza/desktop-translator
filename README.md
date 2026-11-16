@@ -45,8 +45,8 @@ It works the same in a browser, desktop app, chat box, email or prompt box.
 | ✂️ **Selection aware** | Select part of your text to convert only that part. With nothing selected, the whole box is converted. |
 | 📋 **Copy mode** | Instead of replacing, it can just copy the result and show it in the panel. |
 | 📝 **Manual panel** | Right-click the bubble to type or paste text, convert it, and copy the result. |
-| 🔌 **Pluggable engines** | Ollama (local), OpenRouter (sign in), any OpenAI-compatible API, or Google's free fallback. |
-| 🔐 **OAuth sign-in** | Sign in to OpenRouter in your browser. You don't need to copy an API key. |
+| 🔌 **Pluggable engines** | Ollama (local), GitHub Copilot (sign in), OpenRouter (sign in), OpenCode Zen, any OpenAI-compatible API, or Google's free fallback. |
+| 🔐 **Sign-in, no key copying** | GitHub Copilot uses a device code; OpenRouter uses browser sign-in (OAuth). |
 | 🗝️ **Secure secrets** | API keys and tokens are kept in Windows Credential Manager, not in config files. |
 | 🖥️ **Tray icon** | Show or hide the bubble, open settings, quit. |
 
@@ -80,11 +80,25 @@ It works the same in a browser, desktop app, chat box, email or prompt box.
 | Engine | Cost | Privacy | Grammar fix | Setup |
 |---|---|---|---|---|
 | **Ollama** (local) | Free | 100% offline | ✅ | Install [Ollama](https://ollama.com), then run `ollama pull qwen3:0.6b` |
+| **GitHub Copilot** (sign-in) ⚠️ unofficial | Your Copilot plan (Free works) | Sent to GitHub | ✅ | Settings → **Sign in**, enter the code on github.com |
 | **OpenRouter** (OAuth) | Free models | Sent to OpenRouter | ✅ | Settings → **Sign in** (browser) |
+| **OpenCode Zen** | Pay as you go | Sent to OpenCode | ✅ | Settings → **Get key**, paste the API key |
 | **OpenAI-compatible** | Free tiers or paid | Sent to the provider | ✅ | Base URL, API key, model |
 | **Google** (fallback) | Free | Sent to Google | ❌ translate only | None |
 
-**Auto** (the default) tries Ollama first, then OpenRouter if you're signed in, then Google.
+**Auto** (the default) tries Ollama first, then Copilot and OpenRouter if you're signed in, then Google.
+
+### GitHub Copilot sign-in (unofficial)
+GitHub has no official Copilot API for third-party apps. This app uses the same method as OpenCode's Copilot login:
+
+1. Click **Sign in**. A code is shown and copied to your clipboard, and github.com/login/device opens.
+2. Paste the code and approve. The app stores your GitHub token in Windows Credential Manager.
+3. For each request, the token is exchanged for a short-lived Copilot token through GitHub's internal `copilot_internal` endpoint.
+
+> ⚠️ This uses the VS Code Copilot client ID and undocumented endpoints. GitHub may change or block them at any time, and using them may break GitHub's terms. Use it at your own risk. `gpt-4.1` and `gpt-4o` don't use premium requests.
+
+### OpenCode Zen
+OpenCode Zen has no OAuth, only API keys. Click **Get key**, sign in at opencode.ai/auth, add billing, copy the key and paste it. Zen's free models (for example `big-pickle`) are meant for the OpenCode app and may refuse calls from other apps.
 
 ### OpenRouter sign-in (OAuth)
 Many free API-key programs have closed. OpenRouter supports OAuth with PKCE for desktop apps:

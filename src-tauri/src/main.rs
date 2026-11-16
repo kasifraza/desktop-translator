@@ -41,6 +41,7 @@ fn write_settings(app: &AppHandle, s: &Settings) -> Result<(), String> {
     }
     let mut clean = s.clone();
     clean.openai_key.clear();
+    clean.opencode_key.clear();
     let json = serde_json::to_string_pretty(&clean).map_err(|e| e.to_string())?;
     std::fs::write(path, json).map_err(|e| e.to_string())
 }
@@ -57,7 +58,14 @@ fn load_settings(app: &AppHandle) -> Settings {
     if s.openai_key.is_empty() {
         s.openai_key = auth::secret_get("openai");
     }
+    if !s.opencode_key.is_empty() && auth::secret_set("opencode", &s.opencode_key).is_ok() {
+        let _ = write_settings(app, &s);
+    }
+    if s.opencode_key.is_empty() {
+        s.opencode_key = auth::secret_get("opencode");
+    }
     s.openrouter_key = auth::secret_get("openrouter");
+    s.github_token = auth::secret_get("github-copilot");
     s
 }
 
@@ -175,9 +183,11 @@ fn get_settings(state: State<'_, AppState>) -> Settings {
 fn save_settings(app: AppHandle, state: State<'_, AppState>, mut settings: Settings) -> Result<(), String> {
     register_hotkey(&app, &settings.hotkey)?;
     auth::secret_set("openai", settings.openai_key.trim())?;
+    auth::secret_set("opencode", settings.opencode_key.trim())?;
     write_settings(&app, &settings)?;
     let mut cur = state.settings.lock().unwrap();
-    settings.openrouter_key = std::mem::take(&mut cur.openrouter_key); // UI never sees it
+    settings.openrouter_key = std::mem::take(&mut cur.openrouter_key); // UI never sees these
+    settings.github_token = std::mem::take(&mut cur.github_token);
     *cur = settings;
     Ok(())
 }
@@ -185,21 +195,37 @@ fn save_settings(app: AppHandle, state: State<'_, AppState>, mut settings: Setti
 #[derive(Serialize)]
 struct AuthStatus {
     openrouter: bool,
+    copilot: bool,
 }
 
 #[tauri::command]
 fn auth_status(state: State<'_, AppState>) -> AuthStatus {
-    AuthStatus { openrouter: !state.settings.lock().unwrap().openrouter_key.is_empty() }
+    let s = state.settings.lock().unwrap();
+    AuthStatus { openrouter: !s.openrouter_key.is_empty(), copilot: !s.github_token.is_empty() }
 }
 
 /// Opens the browser for OpenRouter sign-in, waits for the redirect, stores the key.
 #[tauri::command]
 async fn oauth_login(app: AppHandle, state: State<'_, AppState>, provider: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    if provider == "copilot" {
+        let d = auth::copilot_device_start(&state.client).await?;
+        let _ = input::set_clipboard(&d.user_code);
+        let _ = app.emit("device-code", d.clone());
+        app.opener()
+            .open_url(d.verification_uri.clone(), None::<&str>)
+            .map_err(|e| format!("Could not open browser: {e}"))?;
+        let gh = auth::copilot_device_poll(&state.client, &d).await?;
+        auth::copilot_token(&state.client, &gh).await?; // verify the subscription now
+        auth::secret_set("github-copilot", &gh)?;
+        state.settings.lock().unwrap().github_token = gh;
+        show_panel_impl(&app);
+        return Ok(());
+    }
     if provider != "openrouter" {
         return Err(format!("Unknown provider '{provider}'"));
     }
     let pending = auth::openrouter_begin()?;
-    use tauri_plugin_opener::OpenerExt;
     app.opener()
         .open_url(pending.auth_url.clone(), None::<&str>)
         .map_err(|e| format!("Could not open browser: {e}"))?;
@@ -217,17 +243,33 @@ async fn oauth_login(app: AppHandle, state: State<'_, AppState>, provider: Strin
 }
 
 #[tauri::command]
+fn open_link(app: AppHandle, url: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    const ALLOWED: [&str; 3] = ["https://opencode.ai/", "https://github.com/", "https://openrouter.ai/"];
+    if !ALLOWED.iter().any(|p| url.starts_with(p)) {
+        return Err("Link not allowed".into());
+    }
+    app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn oauth_cancel() {
     auth::cancel_logins();
 }
 
 #[tauri::command]
 fn oauth_logout(state: State<'_, AppState>, provider: String) -> Result<(), String> {
-    if provider != "openrouter" {
-        return Err(format!("Unknown provider '{provider}'"));
+    match provider.as_str() {
+        "openrouter" => {
+            auth::secret_set("openrouter", "")?;
+            state.settings.lock().unwrap().openrouter_key.clear();
+        }
+        "copilot" => {
+            auth::secret_set("github-copilot", "")?;
+            state.settings.lock().unwrap().github_token.clear();
+        }
+        _ => return Err(format!("Unknown provider '{provider}'")),
     }
-    auth::secret_set("openrouter", "")?;
-    state.settings.lock().unwrap().openrouter_key.clear();
     Ok(())
 }
 
@@ -278,6 +320,7 @@ fn main() {
             auth_status,
             oauth_login,
             oauth_cancel,
+            open_link,
             oauth_logout,
             show_panel,
             quit_app
