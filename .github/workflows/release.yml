@@ -1,0 +1,110 @@
+# Builds the Windows installer from source on every version tag (vX.Y.Z),
+# optionally signs it through SignPath, and publishes a GitHub release.
+#
+# Signing turns on automatically once these are configured in the repo settings:
+#   Variables:  SIGNPATH_ORGANIZATION_ID, SIGNPATH_PROJECT_SLUG, SIGNPATH_SIGNING_POLICY_SLUG
+#   Secret:     SIGNPATH_API_TOKEN
+# Without them the installer is published unsigned.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: # manual run: builds and uploads the artifact, no release
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Read version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          "version=$v" >> $env:GITHUB_OUTPUT
+          if ($env:GITHUB_REF -like 'refs/tags/*' -and $env:GITHUB_REF_NAME -ne "v$v") {
+            throw "Tag $env:GITHUB_REF_NAME does not match tauri.conf.json version $v"
+          }
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test
+        working-directory: src-tauri
+        run: cargo test --locked
+
+      - name: Build installer
+        run: npx tauri build
+
+      - name: Collect installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $src = Get-ChildItem "src-tauri/target/release/bundle/nsis/*-setup.exe" | Select-Object -First 1
+          Copy-Item $src.FullName "dist/TranslateBubble_${{ steps.ver.outputs.version }}_x64-setup.exe"
+
+      - name: Upload unsigned installer
+        id: upload-unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-unsigned
+          path: dist/*.exe
+          if-no-files-found: error
+
+      - name: Sign with SignPath
+        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600 # leaves time for manual approval
+          output-artifact-directory: dist-signed
+
+      - name: Choose files to publish
+        shell: pwsh
+        run: |
+          $dir = if (Test-Path dist-signed) { "dist-signed" } else { "dist" }
+          New-Item -ItemType Directory -Force publish | Out-Null
+          Copy-Item "$dir/*.exe" publish/
+          Get-ChildItem publish/*.exe | ForEach-Object {
+            $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$h  $($_.Name)" | Out-File -Encoding ascii -Append publish/SHA256SUMS.txt
+          }
+          Get-Content publish/SHA256SUMS.txt
+          if ($dir -eq "dist") { Write-Host "::warning::Installer is NOT code-signed (SignPath not configured)" }
+
+      - name: Upload final installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: publish/*
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Translate Bubble ${{ github.ref_name }}
+          files: publish/*
+          generate_release_notes: true

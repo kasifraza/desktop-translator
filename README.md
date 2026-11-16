@@ -213,6 +213,17 @@ cargo test -- --include-ignored
 - Apps that copy the whole line when nothing is selected (for example VS Code) can behave unexpectedly. Select the text first in those apps.
 - Ideas: remember the bubble's position, option to start with Windows, target languages other than English, a "rephrase politely" mode.
 
+## Releases and code signing
+
+Installers are built from source by GitHub Actions ([release.yml](.github/workflows/release.yml)) for every `vX.Y.Z` tag and published to Releases together with `SHA256SUMS.txt`. To cut a release, bump `version` in `src-tauri/tauri.conf.json`, then:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+**Code signing policy:** see [CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md). An application to the SignPath Foundation free open-source signing program is pending. Until it's approved, Windows SmartScreen may show "Windows protected your PC". Click **More info**, then **Run anyway**.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
