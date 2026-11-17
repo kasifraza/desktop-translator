@@ -196,12 +196,20 @@ fn save_settings(app: AppHandle, state: State<'_, AppState>, mut settings: Setti
 struct AuthStatus {
     openrouter: bool,
     copilot: bool,
+    opencode: bool,
+    opencode_email: Option<String>,
 }
 
 #[tauri::command]
 fn auth_status(state: State<'_, AppState>) -> AuthStatus {
     let s = state.settings.lock().unwrap();
-    AuthStatus { openrouter: !s.openrouter_key.is_empty(), copilot: !s.github_token.is_empty() }
+    let opencode = auth::zen_signed_in();
+    AuthStatus {
+        openrouter: !s.openrouter_key.is_empty(),
+        copilot: !s.github_token.is_empty(),
+        opencode,
+        opencode_email: if opencode { auth::zen_email() } else { None },
+    }
 }
 
 /// Opens the browser for OpenRouter sign-in, waits for the redirect, stores the key.
@@ -219,6 +227,16 @@ async fn oauth_login(app: AppHandle, state: State<'_, AppState>, provider: Strin
         auth::copilot_token(&state.client, &gh).await?; // verify the subscription now
         auth::secret_set("github-copilot", &gh)?;
         state.settings.lock().unwrap().github_token = gh;
+        show_panel_impl(&app);
+        return Ok(());
+    }
+    if provider == "opencode" {
+        let d = auth::zen_device_start(&state.client).await?;
+        let _ = app.emit("device-code", d.clone());
+        app.opener()
+            .open_url(d.verification_uri.clone(), None::<&str>)
+            .map_err(|e| format!("Could not open browser: {e}"))?;
+        auth::zen_device_poll(&state.client, &d).await?;
         show_panel_impl(&app);
         return Ok(());
     }
@@ -252,6 +270,12 @@ async fn copilot_models(state: State<'_, AppState>) -> Result<Vec<auth::CopilotM
 }
 
 #[tauri::command]
+async fn opencode_models(state: State<'_, AppState>) -> Result<Vec<auth::ZenModel>, String> {
+    let key = state.settings.lock().unwrap().opencode_key.clone();
+    auth::zen_models(&state.client, &key).await
+}
+
+#[tauri::command]
 fn open_link(app: AppHandle, url: String) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
     const ALLOWED: [&str; 3] = ["https://opencode.ai/", "https://github.com/", "https://openrouter.ai/"];
@@ -273,6 +297,7 @@ fn oauth_logout(state: State<'_, AppState>, provider: String) -> Result<(), Stri
             auth::secret_set("openrouter", "")?;
             state.settings.lock().unwrap().openrouter_key.clear();
         }
+        "opencode" => auth::zen_logout()?,
         "copilot" => {
             auth::secret_set("github-copilot", "")?;
             state.settings.lock().unwrap().github_token.clear();
@@ -331,6 +356,7 @@ fn main() {
             oauth_cancel,
             open_link,
             copilot_models,
+            opencode_models,
             oauth_logout,
             show_panel,
             quit_app

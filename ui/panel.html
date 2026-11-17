@@ -66,7 +66,7 @@
       <option value="ollama">Ollama (local, private, offline)</option>
       <option value="copilot">GitHub Copilot — sign in (unofficial)</option>
       <option value="openrouter">OpenRouter — sign in, free models</option>
-      <option value="opencode">OpenCode Zen — API key</option>
+      <option value="opencode">OpenCode Zen — sign in or API key</option>
       <option value="openai">OpenAI-compatible API (Groq / OpenRouter / LM Studio)</option>
       <option value="google">Google free (no grammar fixing)</option>
     </select>
@@ -101,12 +101,22 @@
   </fieldset>
   <fieldset id="f-opencode"><legend>OpenCode Zen</legend>
     <div class="row">
-      <div class="grow"><label>API key</label><input id="opencode_key" type="password" /></div>
+      <span class="grow" id="oc-status">Checking…</span>
+      <button class="p" id="oc-login">Sign in</button>
+      <button class="s hidden" id="oc-cancel">Cancel</button>
+      <button class="s hidden" id="oc-logout">Sign out</button>
+    </div>
+    <div class="hidden" id="oc-code-box" style="margin-top:8px">
+      Confirm this code on opencode.ai:
+      <div style="font:600 22px Consolas,monospace;letter-spacing:3px;margin:4px 0" id="oc-code"></div>
+    </div>
+    <div class="row" id="oc-key-row">
+      <div class="grow"><label>Or API key</label><input id="opencode_key" type="password" /></div>
       <button class="s" id="oc-getkey" style="align-self:flex-end">Get key</button>
     </div>
-    <label>Model</label><input id="opencode_model" list="oc-models" />
-    <datalist id="oc-models"></datalist>
-    <div class="hint">Sign in at opencode.ai/auth, add billing and copy your key. Free models may only work inside the OpenCode app.</div>
+    <label>Model</label>
+    <select id="opencode_model"><option value="big-pickle">big-pickle</option></select>
+    <div class="hint">Sign in with your OpenCode account (same as the OpenCode desktop app), or paste a Zen API key. The list shows models enabled for your workspace. Paid models use Zen credits; free models may refuse requests from apps other than OpenCode.</div>
   </fieldset>
   <fieldset id="f-openrouter"><legend>OpenRouter account</legend>
     <div class="row">
@@ -194,13 +204,21 @@
     if (p === 'opencode') loadZenModels();
   };
 
-  let zenLoaded = false;
+  // Live Zen model list (models enabled for your OpenCode workspace when signed in)
   async function loadZenModels() {
-    if (zenLoaded) return; zenLoaded = true;
+    const sel = $('opencode_model'), cur = sel.value || 'big-pickle';
     try {
-      const j = await (await fetch('https://opencode.ai/zen/v1/models')).json();
-      $('oc-models').innerHTML = (j.data || []).map(m => `<option value="${m.id}">${m.id.endsWith('-free') || m.id === 'big-pickle' ? 'free' : ''}</option>`).join('');
-    } catch { zenLoaded = false; }
+      const list = await invoke('opencode_models');
+      if (!list.length) return;
+      const ids = list.map(m => m.id);
+      if (!ids.includes(cur)) ids.unshift(cur);
+      sel.innerHTML = ids.map(id => {
+        const m = list.find(x => x.id === id);
+        const label = m ? `${m.name}  (${id})${m.free ? '  · free' : ''}` : `${id} (not available)`;
+        return `<option value="${id}">${label}</option>`;
+      }).join('');
+      sel.value = cur;
+    } catch (e) { msg($('sm'), 'Zen models: ' + e, 'err'); }
   }
   $('oc-getkey').onclick = () => invoke('open_link', { url: 'https://opencode.ai/auth' });
 
@@ -215,6 +233,11 @@
     $('or-status').textContent = a.openrouter ? 'Signed in ✓' : 'Not signed in';
     $('or-status').style.color = a.openrouter ? 'var(--ok)' : 'var(--mute)';
     show('or-login', !a.openrouter); show('or-logout', a.openrouter); show('or-cancel', false);
+    $('oc-status').textContent = a.opencode ? 'Signed in ✓' + (a.opencode_email ? ' ' + a.opencode_email : '') : 'Not signed in';
+    $('oc-status').style.color = a.opencode ? 'var(--ok)' : 'var(--mute)';
+    show('oc-login', !a.opencode); show('oc-logout', a.opencode); show('oc-cancel', false); show('oc-code-box', false);
+    show('oc-key-row', !a.opencode);
+    if ($('provider').value === 'opencode') loadZenModels();
   }
   $('or-login').onclick = async () => {
     $('or-status').textContent = 'Waiting for browser sign-in…'; $('or-status').style.color = 'var(--mute)';
@@ -244,9 +267,23 @@
 
   // GitHub Copilot device flow
   listen('device-code', ({ payload }) => {
-    $('cp-code').textContent = payload.user_code; show('cp-code-box', true);
-    $('cp-status').textContent = 'Waiting for GitHub…';
+    const p = payload.provider === 'opencode' ? 'oc' : 'cp';
+    $(p + '-code').textContent = payload.user_code; show(p + '-code-box', true);
+    $(p + '-status').textContent = p === 'oc' ? 'Waiting for opencode.ai…' : 'Waiting for GitHub…';
   });
+  $('oc-login').onclick = async () => {
+    $('oc-status').textContent = 'Starting…'; $('oc-status').style.color = 'var(--mute)';
+    show('oc-login', false); show('oc-cancel', true);
+    try { await invoke('oauth_login', { provider: 'opencode' }); msg($('sm'), 'Signed in to OpenCode ✓', 'ok'); }
+    catch (e) { msg($('sm'), String(e), 'err'); }
+    refreshAuth();
+  };
+  $('oc-cancel').onclick = () => invoke('oauth_cancel');
+  $('oc-logout').onclick = async () => {
+    try { await invoke('oauth_logout', { provider: 'opencode' }); msg($('sm'), 'Signed out', 'ok'); }
+    catch (e) { msg($('sm'), String(e), 'err'); }
+    refreshAuth();
+  };
   $('cp-login').onclick = async () => {
     $('cp-status').textContent = 'Starting…'; $('cp-status').style.color = 'var(--mute)';
     show('cp-login', false); show('cp-cancel', true);
@@ -272,6 +309,9 @@
     const cm = $('copilot_model');
     if (s.copilot_model && ![...cm.options].some(o => o.value === s.copilot_model))
       cm.add(new Option(s.copilot_model, s.copilot_model));
+    const om = $('opencode_model');
+    if (s.opencode_model && ![...om.options].some(o => o.value === s.opencode_model))
+      om.add(new Option(s.opencode_model, s.opencode_model));
     FIELDS.forEach(k => $(k).value = s[k] ?? '');
     syncProvider();
     refreshAuth();

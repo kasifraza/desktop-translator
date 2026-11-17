@@ -30,7 +30,7 @@ This program will not transfer any information to other networked systems unless
   - **OpenAI-compatible:** the base URL you entered.
   - **Google:** translate.googleapis.com ([privacy policy](https://policies.google.com/privacy)).
   - **Auto:** tries Ollama, then Copilot and OpenRouter if you're signed in, then Google. To prevent fallback to cloud services, select **Ollama** instead of **Auto**.
-- **Sign-in:** at your request, OpenRouter sign-in opens openrouter.ai in your browser, and GitHub Copilot sign-in opens github.com/login/device.
+- **Sign-in:** at your request, OpenRouter sign-in opens openrouter.ai in your browser, GitHub Copilot sign-in opens github.com/login/device, and OpenCode Zen sign-in opens opencode.ai/console.
 - **No telemetry:** no analytics, crash reporting, or update checks.
 - **Local storage:** settings are stored in `%APPDATA%\tech.openforge.translatebubble\`, and API keys and tokens are stored in Windows Credential Manager.
 

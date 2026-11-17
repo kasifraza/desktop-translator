@@ -334,10 +334,16 @@ async fn responses_ext(
 }
 
 async fn opencode(c: &reqwest::Client, s: &Settings, text: &str) -> Result<String, String> {
-    if s.opencode_key.trim().is_empty() {
-        return Err("No OpenCode Zen API key (Settings -> Get key)".into());
-    }
     let model = if s.opencode_model.trim().is_empty() { "big-pickle" } else { s.opencode_model.trim() };
+    // Prefer the OpenCode account sign-in; fall back to a pasted API key.
+    if crate::auth::zen_signed_in() {
+        let cred = crate::auth::zen_access(c).await?;
+        let h = crate::auth::zen_headers(&cred);
+        return openai_ext(c, "https://opencode.ai/zen/v1", &cred.access, model, text, &h).await;
+    }
+    if s.opencode_key.trim().is_empty() {
+        return Err("Not signed in to OpenCode (Settings -> Sign in, or paste an API key)".into());
+    }
     openai(c, "https://opencode.ai/zen/v1", &s.opencode_key, model, text).await
 }
 
@@ -431,6 +437,21 @@ Hello.", "x"), "Hello.");
             println!("COPILOT {m} ({} ms): {out:?}", t.elapsed().as_millis());
             assert!(out.is_ok());
         }
+    }
+
+    /// Network + your OpenCode sign-in: translate with a few free Zen models.
+    #[test]
+    #[ignore]
+    fn zen_signed_in_translate() {
+        let c = reqwest::Client::new();
+        let mut ok = false;
+        for m in ["nemotron-3.5-lightning-free", "mimo-v2.6-flash-free", "glm-5.3-flash-free", "big-pickle"] {
+            let s = Settings { provider: "opencode".into(), opencode_model: m.into(), ..Default::default() };
+            let r = tauri::async_runtime::block_on(translate(&c, &s, "kal meeting h kya 5 baje? mujhe thoda late hoga"));
+            println!("ZEN {m}: {r:?}");
+            ok |= r.is_ok();
+        }
+        assert!(ok);
     }
 
     /// Uses the saved settings (%APPDATA%). Network + real API key.

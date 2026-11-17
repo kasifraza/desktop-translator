@@ -254,6 +254,8 @@ pub const COPILOT_HEADERS: [(&str, &str); 4] = [
 
 #[derive(serde::Serialize, Clone)]
 pub struct DeviceCode {
+    /// "copilot" or "opencode", so the UI shows the code in the right place.
+    pub provider: &'static str,
     pub user_code: String,
     pub verification_uri: String,
     #[serde(skip)]
@@ -279,6 +281,7 @@ pub async fn copilot_device_start(c: &reqwest::Client) -> Result<DeviceCode, Str
     let s = |k: &str| v[k].as_str().map(str::to_string);
     match (s("device_code"), s("user_code"), s("verification_uri")) {
         (Some(device_code), Some(user_code), Some(verification_uri)) => Ok(DeviceCode {
+            provider: "copilot",
             user_code,
             verification_uri,
             device_code,
@@ -411,4 +414,283 @@ pub async fn copilot_models(c: &reqwest::Client, github_token: &str) -> Result<V
     out.sort_by(|a, b| a.multiplier.partial_cmp(&b.multiplier).unwrap().then(a.id.cmp(&b.id)));
     out.dedup_by(|a, b| a.id == b.id);
     Ok(out)
+}
+
+// ---------- OpenCode Zen sign-in (OpenCode Console account) ----------
+//
+// Same device flow the OpenCode app uses ("OpenCode Console account"):
+// POST {console}/auth/device/code -> user approves in the browser ->
+// POST {console}/auth/device/token returns an access + refresh token.
+// The access token is used as the bearer key for https://opencode.ai/zen/v1.
+
+const ZEN_SERVER: &str = "https://opencode.ai/console";
+const ZEN_CLIENT_ID: &str = "opencode-cli";
+const ZEN_SECRET: &str = "opencode-console";
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+pub struct ZenCredential {
+    pub access: String,
+    pub refresh: String,
+    /// Unix seconds.
+    pub expires: u64,
+    #[serde(default)]
+    pub org_id: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+}
+
+static ZEN_CACHE: std::sync::Mutex<Option<ZenCredential>> = std::sync::Mutex::new(None);
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn zen_load() -> Option<ZenCredential> {
+    serde_json::from_str(&secret_get(ZEN_SECRET)).ok()
+}
+
+fn zen_save(cred: &ZenCredential) -> Result<(), String> {
+    secret_set(ZEN_SECRET, &serde_json::to_string(cred).map_err(|e| e.to_string())?)?;
+    *ZEN_CACHE.lock().unwrap() = Some(cred.clone());
+    Ok(())
+}
+
+pub fn zen_signed_in() -> bool {
+    ZEN_CACHE.lock().unwrap().is_some() || zen_load().is_some()
+}
+
+pub fn zen_email() -> Option<String> {
+    zen_load().and_then(|c| c.email)
+}
+
+pub fn zen_logout() -> Result<(), String> {
+    *ZEN_CACHE.lock().unwrap() = None;
+    secret_set(ZEN_SECRET, "")
+}
+
+pub async fn zen_device_start(c: &reqwest::Client) -> Result<DeviceCode, String> {
+    let r = c
+        .post(format!("{ZEN_SERVER}/auth/device/code"))
+        .header("Accept", "application/json")
+        .json(&serde_json::json!({"client_id": ZEN_CLIENT_ID, "supports_org_scope": true}))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = r.status();
+    let v: serde_json::Value = r.json().await.map_err(|e| format!("OpenCode sign-in {status}: {e}"))?;
+    let s = |k: &str| v[k].as_str().map(str::to_string);
+    match (s("device_code"), s("user_code"), s("verification_uri_complete")) {
+        (Some(device_code), Some(user_code), Some(uri)) => {
+            let verification_uri = if uri.starts_with("http") {
+                uri
+            } else if uri.starts_with('/') {
+                format!("https://opencode.ai{uri}")
+            } else {
+                format!("{ZEN_SERVER}/{uri}")
+            };
+            if !verification_uri.starts_with("https://opencode.ai/") {
+                return Err("OpenCode sign-in returned an unexpected URL".into());
+            }
+            Ok(DeviceCode {
+                provider: "opencode",
+                user_code,
+                verification_uri,
+                device_code,
+                interval: v["interval"].as_u64().unwrap_or(5).max(1),
+                gen: LOGIN_GEN.fetch_add(1, Ordering::SeqCst) + 1,
+            })
+        }
+        _ => Err(format!("OpenCode sign-in {status}: {}", v["error"].as_str().unwrap_or("unexpected response"))),
+    }
+}
+
+fn zen_from_token(v: &serde_json::Value, old: Option<&ZenCredential>) -> Option<ZenCredential> {
+    Some(ZenCredential {
+        access: v["access_token"].as_str()?.to_string(),
+        refresh: v["refresh_token"].as_str().map(str::to_string).or_else(|| old.map(|o| o.refresh.clone()))?,
+        expires: now_secs() + v["expires_in"].as_u64().unwrap_or(3600),
+        org_id: v["org_id"].as_str().map(str::to_string).or_else(|| old.and_then(|o| o.org_id.clone())),
+        email: old.and_then(|o| o.email.clone()),
+    })
+}
+
+/// Polls until the user approves in the browser, then stores the credential.
+pub async fn zen_device_poll(c: &reqwest::Client, d: &DeviceCode) -> Result<ZenCredential, String> {
+    let mut interval = d.interval;
+    let deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        tokio_sleep(Duration::from_secs(interval)).await;
+        if LOGIN_GEN.load(Ordering::SeqCst) != d.gen {
+            return Err("Sign-in cancelled".into());
+        }
+        if Instant::now() > deadline {
+            return Err("Sign-in timed out".into());
+        }
+        let v: serde_json::Value = c
+            .post(format!("{ZEN_SERVER}/auth/device/token"))
+            .header("Accept", "application/json")
+            .json(&serde_json::json!({
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": d.device_code,
+                "client_id": ZEN_CLIENT_ID
+            }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(mut cred) = zen_from_token(&v, None) {
+            // Best effort: remember the account email for the status line.
+            if let Ok(r) = c.get(format!("{ZEN_SERVER}/api/user")).bearer_auth(&cred.access).send().await {
+                if let Ok(u) = r.json::<serde_json::Value>().await {
+                    cred.email = u["email"].as_str().map(str::to_string);
+                }
+            }
+            zen_save(&cred)?;
+            return Ok(cred);
+        }
+        match v["error"].as_str() {
+            Some("authorization_pending") => {}
+            Some("slow_down") => interval += 5,
+            Some("expired_token") => return Err("The code expired. Try again.".into()),
+            Some("access_denied") => return Err("Sign-in was cancelled on opencode.ai".into()),
+            Some(e) => return Err(format!("OpenCode: {e}")),
+            None => {}
+        }
+    }
+}
+
+/// Current Zen credential, refreshed when the access token is about to expire.
+pub async fn zen_access(c: &reqwest::Client) -> Result<ZenCredential, String> {
+    let cached = ZEN_CACHE.lock().unwrap().clone();
+    let cred = match cached.or_else(zen_load) {
+        Some(x) => x,
+        None => return Err("Not signed in to OpenCode (Settings -> Sign in)".into()),
+    };
+    if cred.expires > now_secs() + 60 {
+        *ZEN_CACHE.lock().unwrap() = Some(cred.clone());
+        return Ok(cred);
+    }
+    let r = c
+        .post(format!("{ZEN_SERVER}/auth/device/token"))
+        .header("Accept", "application/json")
+        .json(&serde_json::json!({
+            "grant_type": "refresh_token",
+            "refresh_token": cred.refresh,
+            "client_id": ZEN_CLIENT_ID
+        }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = r.status();
+    let v: serde_json::Value = r.json().await.unwrap_or_default();
+    match zen_from_token(&v, Some(&cred)) {
+        Some(next) if status.is_success() => {
+            zen_save(&next)?;
+            Ok(next)
+        }
+        _ if status.as_u16() == 400 || status.as_u16() == 401 => {
+            let _ = zen_logout();
+            Err("OpenCode sign-in expired. Sign in again.".into())
+        }
+        _ => Err(format!("OpenCode token refresh {status}")),
+    }
+}
+
+#[cfg(test)]
+mod zen_tests {
+    use super::*;
+
+    /// Network: the OpenCode Console must hand out a device code for the opencode-cli client.
+    #[test]
+    #[ignore]
+    fn zen_device_code_issued() {
+        let c = reqwest::Client::new();
+        let d = tauri::async_runtime::block_on(zen_device_start(&c)).unwrap();
+        assert!(!d.user_code.is_empty());
+        assert!(d.verification_uri.starts_with("https://opencode.ai/console/device?"), "{}", d.verification_uri);
+    }
+
+    #[test]
+    fn zen_token_parse_keeps_old_refresh() {
+        let old = ZenCredential { access: "a".into(), refresh: "r1".into(), expires: 0, org_id: Some("o".into()), email: None };
+        let v = serde_json::json!({"access_token": "b", "expires_in": 60});
+        let n = zen_from_token(&v, Some(&old)).unwrap();
+        assert_eq!((n.access.as_str(), n.refresh.as_str(), n.org_id.as_deref()), ("b", "r1", Some("o")));
+        assert!(zen_from_token(&serde_json::json!({"error": "authorization_pending"}), None).is_none());
+    }
+}
+
+/// Headers the OpenCode app sends with Zen requests for a signed-in workspace.
+pub fn zen_headers(cred: &ZenCredential) -> Vec<(&'static str, &str)> {
+    match cred.org_id.as_deref() {
+        Some(org) => vec![("x-opencode-org-id", org)],
+        None => Vec::new(),
+    }
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct ZenModel {
+    pub id: String,
+    pub name: String,
+    pub free: bool,
+}
+
+/// Zen models enabled for this account (signed in), or for the API key, or the public list.
+pub async fn zen_models(c: &reqwest::Client, api_key: &str) -> Result<Vec<ZenModel>, String> {
+    let mut req = c.get("https://opencode.ai/zen/v1/models").header("Accept", "application/json");
+    if zen_signed_in() {
+        let cred = zen_access(c).await?;
+        req = req.bearer_auth(&cred.access);
+        for (k, v) in zen_headers(&cred) {
+            req = req.header(k, v);
+        }
+    } else if !api_key.trim().is_empty() {
+        req = req.bearer_auth(api_key.trim());
+    }
+    let r = req.send().await.map_err(|e| e.to_string())?;
+    let status = r.status();
+    let v: serde_json::Value = r.json().await.map_err(|e| format!("Zen models {status}: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("Zen models {status}: {}", v["error"]["message"].as_str().unwrap_or("failed")));
+    }
+    let price = |m: &serde_json::Value, k: &str| m["cost"]["text"][k]["price"].as_f64().unwrap_or(1.0);
+    let mut out: Vec<ZenModel> = v["data"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|m| m["type"].as_str().map_or(true, |t| t == "chat"))
+                .filter_map(|m| {
+                    let id = m["id"].as_str()?.to_string();
+                    Some(ZenModel {
+                        name: m["name"].as_str().unwrap_or(&id).to_string(),
+                        free: price(m, "input") == 0.0 && price(m, "output") == 0.0,
+                        id,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // Free first, then by name.
+    out.sort_by(|a, b| b.free.cmp(&a.free).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    Ok(out)
+}
+
+#[cfg(test)]
+mod zen_model_tests {
+    use super::*;
+
+    /// Network (+ your OpenCode sign-in if present): print the Zen model list.
+    #[test]
+    #[ignore]
+    fn zen_list_models() {
+        let c = reqwest::Client::new();
+        let m = tauri::async_runtime::block_on(zen_models(&c, "")).unwrap();
+        assert!(!m.is_empty());
+        println!("signed_in={} n={}", zen_signed_in(), m.len());
+        for x in &m {
+            println!("{}  {}{}", x.id, x.name, if x.free { "  (free)" } else { "" });
+        }
+    }
 }
