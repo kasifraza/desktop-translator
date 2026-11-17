@@ -249,7 +249,88 @@ async fn copilot(c: &reqwest::Client, s: &Settings, text: &str) -> Result<String
     let mut h: Vec<(&str, &str)> = crate::auth::COPILOT_HEADERS.to_vec();
     h.push(("Openai-Intent", "conversation-edits"));
     h.push(("X-Initiator", "user"));
-    openai_ext(c, "https://api.githubcopilot.com", &token, model, text, &h).await
+    const BASE: &str = "https://api.githubcopilot.com";
+
+    // Some models (newest GPT/Codex) are only served on /responses. Remember them.
+    static RESPONSES_ONLY: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    if RESPONSES_ONLY.lock().unwrap().iter().any(|m| m == model) {
+        return responses_ext(c, BASE, &token, model, text, &h).await;
+    }
+    match openai_ext(c, BASE, &token, model, text, &h).await {
+        Err(e) if e.contains("/chat/completions") => {
+            RESPONSES_ONLY.lock().unwrap().push(model.to_string());
+            responses_ext(c, BASE, &token, model, text, &h).await
+        }
+        r => r,
+    }
+}
+
+/// OpenAI Responses API (`POST {base}/responses`), used for models that don't
+/// support chat completions.
+async fn responses_ext(
+    c: &reqwest::Client,
+    base: &str,
+    key: &str,
+    model: &str,
+    text: &str,
+    extra: &[(&str, &str)],
+) -> Result<String, String> {
+    let url = format!("{}/responses", base.trim_end_matches('/'));
+    let mut input = Vec::new();
+    for (i, o) in SHOTS {
+        input.push(json!({"role": "user", "content": format!("<text>{i}</text>")}));
+        input.push(json!({"role": "assistant", "content": o}));
+    }
+    input.push(json!({"role": "user", "content": format!("<text>{text}</text>")}));
+    let mut body = json!({
+        "model": model,
+        "instructions": SYSTEM,
+        "input": input,
+        "store": false,
+        "reasoning": {"effort": "low"}
+    });
+
+    let mut tries = 0;
+    let v = loop {
+        tries += 1;
+        let mut req = c.post(&url).json(&body).bearer_auth(key);
+        for (k, v) in extra {
+            req = req.header(*k, *v);
+        }
+        let r = req.send().await.map_err(|e| e.to_string())?;
+        let status = r.status();
+        let v: Value = r.json().await.map_err(|e| e.to_string())?;
+        if status.is_success() {
+            break v;
+        }
+        let msg = v["error"]["message"].as_str().unwrap_or("request failed").to_string();
+        let param = v["error"]["param"].as_str().unwrap_or("");
+        // Drop optional params the model rejects (e.g. reasoning on non-reasoning models).
+        let bad = ["reasoning", "store"]
+            .into_iter()
+            .find(|k| body.get(*k).is_some() && (param.starts_with(*k) || msg.contains(*k)));
+        match bad {
+            Some(k) if status.as_u16() == 400 && tries < 3 => {
+                body.as_object_mut().unwrap().remove(k);
+            }
+            _ => return Err(format!("API {status}: {msg}")),
+        }
+    };
+
+    let mut out = String::new();
+    for item in v["output"].as_array().into_iter().flatten() {
+        if item["type"] == "message" {
+            for part in item["content"].as_array().into_iter().flatten() {
+                if part["type"] == "output_text" {
+                    out.push_str(part["text"].as_str().unwrap_or(""));
+                }
+            }
+        }
+    }
+    if out.trim().is_empty() {
+        return Err("API: empty response".into());
+    }
+    Ok(clean(&out, text))
 }
 
 async fn opencode(c: &reqwest::Client, s: &Settings, text: &str) -> Result<String, String> {
@@ -333,6 +414,23 @@ Hello.", "x"), "Hello.");
         let out = tauri::async_runtime::block_on(translate(&c, &s, "मुझे कल ऑफिस जाना है"));
         println!("result: {out:?}");
         assert!(out.unwrap().to_lowercase().contains("office"));
+    }
+
+    /// Network + Copilot sign-in: one chat-completions model and one responses-only model.
+    #[test]
+    #[ignore]
+    fn copilot_two_endpoints() {
+        let c = reqwest::Client::new();
+        let mut s = Settings::default();
+        s.github_token = crate::auth::secret_get("github-copilot");
+        assert!(!s.github_token.is_empty(), "not signed in to Copilot");
+        for m in ["claude-haiku-5.5", "gpt-6-luna"] {
+            s.copilot_model = m.into();
+            let t = std::time::Instant::now();
+            let out = tauri::async_runtime::block_on(copilot(&c, &s, "kal meeting h kya 5 baje? mujhe thoda late hoga"));
+            println!("COPILOT {m} ({} ms): {out:?}", t.elapsed().as_millis());
+            assert!(out.is_ok());
+        }
     }
 
     /// Uses the saved settings (%APPDATA%). Network + real API key.

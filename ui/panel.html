@@ -95,13 +95,8 @@
       Enter this code on GitHub (already copied):
       <div style="font:600 22px Consolas,monospace;letter-spacing:3px;margin:4px 0" id="cp-code"></div>
     </div>
-    <label>Model</label><input id="copilot_model" list="cp-models" />
-    <datalist id="cp-models">
-      <option value="gpt-4.1">Included in all plans</option>
-      <option value="gpt-4o">Included in all plans</option>
-      <option value="gpt-5-mini">Included in paid plans</option>
-      <option value="claude-sonnet-4.5">Uses premium requests</option>
-    </datalist>
+    <label>Model</label>
+    <select id="copilot_model"><option value="gpt-4.1">gpt-4.1</option></select>
     <div class="hint" style="color:#fbbf24">Unofficial: uses the same internal Copilot API as OpenCode. GitHub may block it or flag the account. Requires a Copilot plan (Free works).</div>
   </fieldset>
   <fieldset id="f-opencode"><legend>OpenCode Zen</legend>
@@ -216,6 +211,7 @@
     $('cp-status').textContent = a.copilot ? 'Signed in ✓' : 'Not signed in';
     $('cp-status').style.color = a.copilot ? 'var(--ok)' : 'var(--mute)';
     show('cp-login', !a.copilot); show('cp-logout', a.copilot); show('cp-cancel', false); show('cp-code-box', false);
+    if (a.copilot) loadCopilotModels();
     $('or-status').textContent = a.openrouter ? 'Signed in ✓' : 'Not signed in';
     $('or-status').style.color = a.openrouter ? 'var(--ok)' : 'var(--mute)';
     show('or-login', !a.openrouter); show('or-logout', a.openrouter); show('or-cancel', false);
@@ -228,6 +224,23 @@
     refreshAuth();
   };
   $('or-cancel').onclick = () => invoke('oauth_cancel');
+
+  // Live Copilot model list (only models enabled for this account)
+  async function loadCopilotModels() {
+    const sel = $('copilot_model'), cur = sel.value || 'gpt-4.1';
+    try {
+      const list = await invoke('copilot_models');
+      if (!list.length) return;
+      const ids = list.map(m => m.id);
+      if (!ids.includes(cur)) ids.unshift(cur);
+      sel.innerHTML = ids.map(id => {
+        const m = list.find(x => x.id === id);
+        const label = m ? `${m.name || id}  (${id})` : `${id} (not available)`;
+        return `<option value="${id}">${label}</option>`;
+      }).join('');
+      sel.value = cur;
+    } catch (e) { msg($('sm'), 'Copilot models: ' + e, 'err'); }
+  }
 
   // GitHub Copilot device flow
   listen('device-code', ({ payload }) => {
@@ -256,6 +269,9 @@
 
   (async () => {
     const s = await invoke('get_settings');
+    const cm = $('copilot_model');
+    if (s.copilot_model && ![...cm.options].some(o => o.value === s.copilot_model))
+      cm.add(new Option(s.copilot_model, s.copilot_model));
     FIELDS.forEach(k => $(k).value = s[k] ?? '');
     syncProvider();
     refreshAuth();

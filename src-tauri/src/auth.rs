@@ -205,6 +205,20 @@ mod tests {
         assert_eq!(d.user_code.len(), 9);
     }
 
+    /// Network + your Copilot sign-in: print the live model list.
+    #[test]
+    #[ignore]
+    fn copilot_list_models() {
+        let gh = secret_get("github-copilot");
+        assert!(!gh.is_empty(), "not signed in to Copilot");
+        let c = reqwest::Client::new();
+        let m = tauri::async_runtime::block_on(copilot_models(&c, &gh)).unwrap();
+        for x in &m {
+            println!("MODEL {} | {} | x{}", x.id, x.name, x.multiplier);
+        }
+        assert!(!m.is_empty());
+    }
+
     #[test]
     fn credential_store_roundtrip() {
         secret_set("unit-test", "s3cret").unwrap();
@@ -354,4 +368,47 @@ pub async fn copilot_token(c: &reqwest::Client, github_token: &str) -> Result<St
         }
         _ => Err(format!("Copilot token {status}: {}", v["message"].as_str().unwrap_or("failed"))),
     }
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct CopilotModel {
+    pub id: String,
+    pub name: String,
+    /// Premium-request multiplier (0 = included in the plan).
+    pub multiplier: f64,
+}
+
+/// Chat models enabled for this Copilot account (live list from GitHub).
+pub async fn copilot_models(c: &reqwest::Client, github_token: &str) -> Result<Vec<CopilotModel>, String> {
+    let token = copilot_token(c, github_token).await?;
+    let mut req = c.get("https://api.githubcopilot.com/models").bearer_auth(token);
+    for (k, v) in COPILOT_HEADERS {
+        req = req.header(k, v);
+    }
+    let v: serde_json::Value = req
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut out: Vec<CopilotModel> = v["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|m| m["capabilities"]["type"] == "chat" && m["model_picker_enabled"] != false)
+        .filter(|m| m["policy"]["state"].as_str().map_or(true, |s| s == "enabled"))
+        .filter_map(|m| {
+            Some(CopilotModel {
+                id: m["id"].as_str()?.to_string(),
+                name: m["name"].as_str().unwrap_or("").to_string(),
+                multiplier: m["billing"]["multiplier"].as_f64().unwrap_or(0.0),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.multiplier.partial_cmp(&b.multiplier).unwrap().then(a.id.cmp(&b.id)));
+    out.dedup_by(|a, b| a.id == b.id);
+    Ok(out)
 }

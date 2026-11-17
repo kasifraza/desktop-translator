@@ -243,6 +243,15 @@ async fn oauth_login(app: AppHandle, state: State<'_, AppState>, provider: Strin
 }
 
 #[tauri::command]
+async fn copilot_models(state: State<'_, AppState>) -> Result<Vec<auth::CopilotModel>, String> {
+    let gh = state.settings.lock().unwrap().github_token.clone();
+    if gh.is_empty() {
+        return Ok(Vec::new());
+    }
+    auth::copilot_models(&state.client, &gh).await
+}
+
+#[tauri::command]
 fn open_link(app: AppHandle, url: String) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
     const ALLOWED: [&str; 3] = ["https://opencode.ai/", "https://github.com/", "https://openrouter.ai/"];
@@ -321,6 +330,7 @@ fn main() {
             oauth_login,
             oauth_cancel,
             open_link,
+            copilot_models,
             oauth_logout,
             show_panel,
             quit_app
